@@ -1,226 +1,53 @@
 """
-MF Holdings API — serves Indian mutual fund portfolio holdings as JSON.
-Uses direct verified Excel URLs per AMC. Auto-refreshes monthly.
-Deploy on Render.com (free tier).
+MF Holdings API — push-based store.
+You upload AMC Excels once via POST /upload, server parses and stores them.
+All clients then get holdings instantly via GET /holdings?fund=...
+
+Deploy free on Render.com.
 """
 
-import os, re, io, logging, asyncio
-from datetime import datetime, timedelta
+import os, re, io, logging, json, hashlib
+from datetime import datetime
 from typing import Optional
-import calendar
+from pathlib import Path
 
-import httpx
 import openpyxl
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 import uvicorn
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-app = FastAPI(title="MF Holdings API", version="2.0.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET","POST"], allow_headers=["*"])
+app = FastAPI(title="MF Holdings API", version="3.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"],
+                   allow_methods=["GET","POST","DELETE"], allow_headers=["*"])
 
-# ─────────────────────────────────────────────────────────────────────────────
-# URL BUILDER — generates candidate URLs for last 3 months
-# ─────────────────────────────────────────────────────────────────────────────
-def last_day(year, month):
-    return calendar.monthrange(year, month)[1]
+# ── Persistent storage on disk (survives Render restarts if using a disk mount)
+# Falls back to in-memory if no disk available
+DATA_DIR = Path(os.environ.get("DATA_DIR", "/tmp/mf_data"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DB_FILE  = DATA_DIR / "holdings.json"
 
-def month_vars(dt: datetime):
-    ld = last_day(dt.year, dt.month)
-    return dict(
-        YYYY=dt.strftime("%Y"), YY=dt.strftime("%y"),
-        MM=dt.strftime("%m"), M=str(dt.month),
-        Mon=dt.strftime("%b"), MON=dt.strftime("%b").upper(), mon=dt.strftime("%b").lower(),
-        Month=dt.strftime("%B"), MONTH=dt.strftime("%B").upper(),
-        MonYYYY=dt.strftime("%b%Y"), MMMYYYY=dt.strftime("%B%Y"),
-        MonYY=dt.strftime("%b%y"), mon_YYYY=f"{dt.strftime('%b').lower()}{dt.year}",
-        DD=f"{ld:02d}", D=str(ld),
-        MonDD=f"{dt.strftime('%B')}_{ld}_{dt.year}",  # February_28_2026
-    )
+holdings_db: dict = {}  # { norm(fund_name): {fund_name, amc, holdings, count, uploaded_at} }
 
-def candidates(patterns, months=3):
-    urls = []
-    dt = datetime.now()
-    for _ in range(months):
-        v = month_vars(dt)
-        for p in patterns:
-            try: urls.append(p.format(**v))
-            except KeyError: pass
-        dt = (dt.replace(day=1) - timedelta(days=1))
-    return list(dict.fromkeys(urls))
+def save_db():
+    try:
+        DB_FILE.write_text(json.dumps(holdings_db, ensure_ascii=False))
+    except Exception as e:
+        log.warning(f"Could not save DB: {e}")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AMC SOURCES — verified direct Excel URL patterns
-# ─────────────────────────────────────────────────────────────────────────────
-AMC_SOURCES = [
-    # ── PPFAS (Parag Parikh) ─────────────────────────────────────────────────
-    # Pattern: PPFAS_Monthly_Portfolio_Report_February_28_2026.xls
-    {
-        "name": "PPFAS",
-        "patterns": [
-            "https://amc.ppfas.com/downloads/portfolio-disclosure/{YYYY}/PPFAS_Monthly_Portfolio_Report_{MonDD}.xls",
-            "https://amc.ppfas.com/downloads/portfolio-disclosure/{YYYY}/PPFAS_Monthly_Portfolio_Report_{MonDD}.xlsx",
-        ],
-    },
-    # ── Canara Robeco ────────────────────────────────────────────────────────
-    {
-        "name": "Canara Robeco",
-        "patterns": [
-            "https://www.canararobeco.com/documents/statutory-disclosures/scheme-dashboard/scheme-monthly-portfolio/{YYYY}/{mon}-{YYYY}.xlsx",
-            "https://www.canararobeco.com/documents/statutory-disclosures/scheme-dashboard/scheme-monthly-portfolio/{YYYY}/{Mon}-{YYYY}.xlsx",
-            "https://www.canararobeco.com/documents/statutory-disclosures/scheme-dashboard/scheme-monthly-portfolio/{YYYY}/{MON}-{YYYY}.xlsx",
-        ],
-    },
-    # ── UTI ─────────────────────────────────────────────────────────────────
-    {
-        "name": "UTI",
-        "patterns": [
-            "https://www.utimf.com/siteassets/downloads/statutory-disclosures/portfolio-disclosure/{YYYY}/{mon}-{YYYY}.xlsx",
-            "https://www.utimf.com/siteassets/downloads/statutory-disclosures/portfolio-disclosure/{YYYY}/{Mon}-{YYYY}.xlsx",
-        ],
-    },
-    # ── Kotak ────────────────────────────────────────────────────────────────
-    {
-        "name": "Kotak",
-        "patterns": [
-            "https://www.kotakmf.com/content/dam/kotakmf/downloads/portfolios/{YYYY}/{Mon}-{YYYY}-Portfolio.xlsx",
-            "https://www.kotakmf.com/content/dam/kotakmf/downloads/portfolios/{YYYY}/Kotak-Portfolio-{Mon}-{YYYY}.xlsx",
-            "https://www.kotakmf.com/content/dam/kotakmf/downloads/portfolios/Kotak-Portfolio-{Mon}-{YYYY}.xlsx",
-        ],
-    },
-    # ── Mirae Asset ──────────────────────────────────────────────────────────
-    {
-        "name": "Mirae Asset",
-        "patterns": [
-            "https://www.miraeassetmf.co.in/Uploads/PortfolioDisclosure/Mirae_Asset_Portfolio_{MonYYYY}.xlsx",
-            "https://www.miraeassetmf.co.in/Uploads/PortfolioDisclosure/Mirae_Asset_Portfolio_{Mon}_{YYYY}.xlsx",
-        ],
-    },
-    # ── DSP ─────────────────────────────────────────────────────────────────
-    {
-        "name": "DSP",
-        "patterns": [
-            "https://www.dspim.com/content/dam/dsp/pdf/portfolio/{YYYY}/DSP_Portfolio_{Mon}_{YYYY}.xlsx",
-            "https://www.dspim.com/content/dam/dsp/pdf/portfolio/DSP_Portfolio_{Mon}_{YYYY}.xlsx",
-        ],
-    },
-    # ── Motilal Oswal ────────────────────────────────────────────────────────
-    {
-        "name": "Motilal Oswal",
-        "patterns": [
-            "https://www.motilaloswalmf.com/webresources/downloads/Portfolio_{Mon}_{YYYY}.xlsx",
-            "https://www.motilaloswalmf.com/webresources/downloads/MOAMC_Portfolio_{Mon}_{YYYY}.xlsx",
-        ],
-    },
-    # ── Axis ─────────────────────────────────────────────────────────────────
-    {
-        "name": "Axis",
-        "patterns": [
-            "https://www.axismf.com/media/axismf/downloads/portfolio/Axis_MF_Portfolio_{Mon}_{YYYY}.xlsx",
-            "https://www.axismf.com/media/axismf/downloads/portfolio/Axis-MF-Portfolio-{Mon}-{YYYY}.xlsx",
-        ],
-    },
-    # ── Nippon ───────────────────────────────────────────────────────────────
-    {
-        "name": "Nippon",
-        "scrape": "https://mf.nipponindiaim.com/investor-service/downloads/factsheet-portfolio-and-other-disclosures",
-        "patterns": [
-            "https://mf.nipponindiaim.com/InvestorServices/FactsheetsDocuments/NIMF-Portfolio-{Mon}-{YYYY}.xlsx",
-            "https://mf.nipponindiaim.com/InvestorServices/FactsheetsDocuments/Nippon-India-MF-Portfolio-{Mon}-{YYYY}.xlsx",
-        ],
-    },
-    # ── SBI ──────────────────────────────────────────────────────────────────
-    {
-        "name": "SBI",
-        "patterns": [
-            "https://www.sbimf.com/sites/default/files/portfolio-disclosures/SBI_MF_Portfolio_{Mon}_{YYYY}.xlsx",
-            "https://www.sbimf.com/sites/default/files/portfolio-disclosures/SBI-Portfolio-{Mon}-{YYYY}.xlsx",
-        ],
-        "scrape": "https://www.sbimf.com/portfolios",
-    },
-    # ── HDFC ─────────────────────────────────────────────────────────────────
-    {
-        "name": "HDFC",
-        "patterns": [
-            "https://www.hdfcfund.com/content/dam/hdfcmf/pdf/monthly-portfolio/{YYYY}/HDFC-MF-Monthly-Portfolio-{Mon}-{YYYY}.xlsx",
-            "https://www.hdfcfund.com/content/dam/hdfcmf/pdf/monthly-portfolio/{YYYY}/HDFC-MF-Portfolio-{Mon}-{YYYY}.xlsx",
-            "https://www.hdfcfund.com/content/dam/hdfcmf/pdf/monthly-portfolio/HDFC-MF-Portfolio-{MonYYYY}.xlsx",
-        ],
-        "scrape": "https://www.hdfcfund.com/statutory-disclosure/portfolio/monthly-portfolio",
-    },
-    # ── ICICI Prudential ─────────────────────────────────────────────────────
-    {
-        "name": "ICICI Prudential",
-        "patterns": [
-            "https://www.icicipruamc.com/docs/default-source/monthly-portfolio/icici-prudential-mf-portfolio-{mon}-{YYYY}.xlsx",
-            "https://www.icicipruamc.com/docs/default-source/monthly-portfolio/icici-pru-portfolio-{mon}-{YYYY}.xlsx",
-        ],
-        "scrape": "https://www.icicipruamc.com/downloads/others/monthly-portfolio-disclosures",
-    },
-    # ── Aditya Birla Sun Life ────────────────────────────────────────────────
-    {
-        "name": "Aditya Birla Sun Life",
-        "patterns": [
-            "https://mutualfund.adityabirlacapital.com/content/dam/abcmf/pdf/portfolio/{YYYY}/ABSL_MF_Portfolio_{Mon}_{YYYY}.xlsx",
-        ],
-        "scrape": "https://mutualfund.adityabirlacapital.com/downloads/portfolios",
-    },
-    # ── Franklin Templeton ───────────────────────────────────────────────────
-    {
-        "name": "Franklin Templeton",
-        "patterns": [
-            "https://www.franklintempletonindia.com/content/dam/ftindia/pdf/downloads/portfolio/{YYYY}/{Mon}_{YYYY}_Portfolio.xlsx",
-            "https://www.franklintempletonindia.com/content/dam/ftindia/pdf/downloads/portfolio/{YYYY}/Franklin_Portfolio_{Mon}_{YYYY}.xlsx",
-        ],
-    },
-    # ── Tata ─────────────────────────────────────────────────────────────────
-    {
-        "name": "Tata",
-        "patterns": [
-            "https://www.tatamutualfund.com/content/dam/tata/pdf/portfolio-disclosure/Tata_MF_Portfolio_{Mon}_{YYYY}.xlsx",
-        ],
-        "scrape": "https://www.tatamutualfund.com/statutory-disclosures/portfolio-disclosures",
-    },
-    # ── Bandhan ──────────────────────────────────────────────────────────────
-    {
-        "name": "Bandhan",
-        "patterns": [
-            "https://www.bandhanmf.com/content/dam/bandhanmf/pdf/portfolio/Bandhan_MF_Portfolio_{Mon}_{YYYY}.xlsx",
-        ],
-        "scrape": "https://www.bandhanmf.com/downloads/monthly-portfolio",
-    },
-    # ── WhiteOak Capital ─────────────────────────────────────────────────────
-    {
-        "name": "WhiteOak Capital",
-        "patterns": [
-            "https://www.whiteoakcapital.com/wp-content/uploads/{YYYY}/{MM}/WhiteOak-Capital-MF-Portfolio-{Mon}-{YYYY}.xlsx",
-        ],
-        "scrape": "https://www.whiteoakcapital.com/mutual-fund/downloads",
-    },
-    # ── Groww ────────────────────────────────────────────────────────────────
-    {
-        "name": "Groww",
-        "scrape": "https://www.growwmf.in/downloads",
-    },
-    # ── Quant ────────────────────────────────────────────────────────────────
-    {
-        "name": "Quant",
-        "scrape": "https://www.quantmutual.com/statutory-disclosures",
-    },
-]
+def load_db():
+    global holdings_db
+    try:
+        if DB_FILE.exists():
+            holdings_db = json.loads(DB_FILE.read_text())
+            log.info(f"Loaded {len(holdings_db)} funds from disk")
+    except Exception as e:
+        log.warning(f"Could not load DB: {e}")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# STATE
-# ─────────────────────────────────────────────────────────────────────────────
-holdings_db: dict = {}
-last_refresh: Optional[datetime] = None
-refresh_lock = asyncio.Lock()
-
-# ─────────────────────────────────────────────────────────────────────────────
-# NORMALISATION
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Name normalisation ─────────────────────────────────────────────────────
 def norm(s: str) -> str:
     n = str(s).lower().strip()
     n = re.sub(r'\s*-?\s*(direct|regular)\s*plan.*$', '', n, flags=re.I)
@@ -228,23 +55,21 @@ def norm(s: str) -> str:
     n = re.sub(r'\s*\(g\)\s*$|\s*\(d\)\s*$', '', n, flags=re.I)
     return re.sub(r'\s+', ' ', n).strip()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# EXCEL PARSER
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Excel parser ───────────────────────────────────────────────────────────
 SKIP = re.compile(
-    r'^(equity$|cash$|grand total|no\.?\s*of\s*stocks|large\s*cap$|mid\s*cap$|'
+    r'^(equity$|cash$|grand\s*total|no\.?\s*of\s*stocks|large\s*cap$|mid\s*cap$|'
     r'small\s*cap$|mf\s*/\s*etf|fixed\s*income|mutual\s*fund\s*units|derivatives|'
     r'total$|sub.?total|net\s*equity|net\s*receivable|cblo|repo|treps|scheme\s*name|'
-    r'riskometer|past\s*performance|portfolio\s*as\s*on)',
+    r'riskometer|past\s*performance|portfolio\s*as\s*on|name\s*of\s*instrument)',
     re.I
 )
 
-def parse_excel(raw: bytes, amc: str) -> dict:
+def parse_excel(raw: bytes, amc_name: str) -> dict:
     out = {}
     try:
         wb = openpyxl.load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
     except Exception as e:
-        log.warning(f"[{amc}] openpyxl: {e}"); return out
+        log.warning(f"openpyxl failed: {e}"); return out
 
     for sname in wb.sheetnames:
         if re.search(r'^(index|cover|content|summary|disclaimer|back|readme)$', sname, re.I):
@@ -268,20 +93,24 @@ def parse_excel(raw: bytes, amc: str) -> dict:
                    and not re.search(r'mutual\s*fund$|asset\s*management', c, re.I):
                     fname = c; break
 
-        # Detect header row (has ISIN column)
+        # Detect header row (ISIN column)
         hrow = ncol = icol = scol = pcol = -1
         for i, row in enumerate(rows):
             cl = [str(c or '').lower().strip() for c in row]
             if 'isin' not in cl: continue
             hrow = i
             icol = cl.index('isin')
-            ncol = next((j for j,c in enumerate(cl)
-                         if c in ('name','instrument','security','company','name of instrument')),
-                        next((j for j,c in enumerate(cl) if 'name' in c or 'instrument' in c), -1))
+            ncol = next(
+                (j for j,c in enumerate(cl) if c in ('name','instrument','security',
+                 'company','name of instrument','issuer')),
+                next((j for j,c in enumerate(cl) if 'name' in c or 'instrument' in c), -1)
+            )
             scol = next((j for j,c in enumerate(cl) if 'sector' in c or 'industry' in c), -1)
-            pcol = next((j for j,c in enumerate(cl)
-                         if re.search(r'%\s*(to|of)\s*(aum|nav)|nav\s*%|aum\s*%|weight\s*%', c)),
-                        next((j for j,c in enumerate(cl) if '%' in c and c != 'isin'), -1))
+            pcol = next(
+                (j for j,c in enumerate(cl)
+                 if re.search(r'%\s*(to|of)\s*(aum|nav)|nav\s*%|aum\s*%|weight\s*%', c)),
+                next((j for j,c in enumerate(cl) if '%' in c and c != 'isin'), -1)
+            )
             break
 
         if hrow < 0 or ncol < 0 or pcol < 0: continue
@@ -290,9 +119,9 @@ def parse_excel(raw: bytes, amc: str) -> dict:
         for row in rows[hrow+1:]:
             if not row or len(row) <= max(ncol, pcol): continue
             name   = str(row[ncol]  or '').strip()
-            isin   = str(row[icol]  or '').strip() if icol >= 0 else ''
-            sector = str(row[scol]  or '').strip() if scol >= 0 else ''
-            rpct   = row[pcol]
+            isin   = str(row[icol]  or '').strip() if icol >= 0 and icol < len(row) else ''
+            sector = str(row[scol]  or '').strip() if scol >= 0 and scol < len(row) else ''
+            rpct   = row[pcol] if pcol < len(row) else None
             if not name or len(name) < 2 or SKIP.match(name): continue
             try:
                 pct = float(str(rpct).replace('%','').replace(',','').strip())
@@ -306,170 +135,143 @@ def parse_excel(raw: bytes, amc: str) -> dict:
                 out[key]["holdings"].extend(holdings)
                 out[key]["count"] = len(out[key]["holdings"])
             else:
-                out[key] = {"fund_name": fname.strip(), "amc": amc,
-                            "holdings": holdings, "count": len(holdings)}
-
+                out[key] = {
+                    "fund_name":   fname.strip(),
+                    "amc":         amc_name,
+                    "holdings":    holdings,
+                    "count":       len(holdings),
+                    "uploaded_at": datetime.utcnow().isoformat(),
+                }
     wb.close()
     return out
 
-# ─────────────────────────────────────────────────────────────────────────────
-# HTTP
-# ─────────────────────────────────────────────────────────────────────────────
-HDR = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "Chrome/122.0.0.0 Safari/537.36",
-    "Accept": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,"
-              "application/vnd.ms-excel,text/html,*/*",
-}
-
-async def get(url, timeout=40):
-    for i in range(3):
-        try:
-            async with httpx.AsyncClient(follow_redirects=True, timeout=timeout,
-                                          headers=HDR, verify=False) as c:
-                r = await c.get(url)
-                if r.status_code == 200 and len(r.content) > 2000:
-                    return r.content
-                log.debug(f"HTTP {r.status_code} {url}")
-        except Exception as e:
-            log.debug(f"Try {i+1} failed {url}: {e}")
-        await asyncio.sleep(1.5 * (i+1))
-    return None
-
-async def scrape_xlsx(page_url):
-    raw = await get(page_url, timeout=20)
-    if not raw: return None
-    html = raw.decode('utf-8', errors='ignore')
-    links = re.findall(r'https?://[^\s"\'<>]+\.xlsx(?:\?[^\s"\'<>]*)?', html, re.I)
-    rel   = re.findall(r'(?:href|src)=["\']([^"\']+\.xlsx[^"\']*)["\']', html, re.I)
-    base  = '/'.join(page_url.split('/')[:3])
-    links += [l if l.startswith('http') else base+('/'+l.lstrip('/')) for l in rel]
-    if not links: return None
-    yr, pm = str(datetime.now().year), (datetime.now().replace(day=1)-timedelta(days=1)).strftime('%b').lower()
-    cm     = datetime.now().strftime('%b').lower()
-    links  = list(dict.fromkeys(links))
-    links.sort(key=lambda l:(10*(yr in l)+3*(cm in l.lower())+2*(pm in l.lower())), reverse=True)
-    return links[0]
-
-# ─────────────────────────────────────────────────────────────────────────────
-# REFRESH
-# ─────────────────────────────────────────────────────────────────────────────
-async def fetch_amc(src):
-    name = src["name"]
-    raw  = None
-
-    # Try direct URL patterns first
-    for url in candidates(src.get("patterns", []), months=3):
-        log.debug(f"[{name}] trying {url}")
-        data = await get(url, timeout=45)
-        if data:
-            raw = data
-            log.info(f"[{name}] ✓ direct {url}")
-            break
-
-    # Fall back to page scrape
-    if raw is None and src.get("scrape"):
-        xl_url = await scrape_xlsx(src["scrape"])
-        if xl_url:
-            data = await get(xl_url, timeout=60)
-            if data:
-                raw = data
-                log.info(f"[{name}] ✓ scraped {xl_url}")
-
-    if raw is None:
-        log.warning(f"[{name}] ✗ not found"); return {}
-
-    result = parse_excel(raw, name)
-    log.info(f"[{name}] → {len(result)} funds")
-    return result
-
-async def refresh_all():
-    global last_refresh
-    async with refresh_lock:
-        log.info("=== Refresh starting ===")
-        results = await asyncio.gather(*[fetch_amc(s) for s in AMC_SOURCES],
-                                        return_exceptions=True)
-        new_db = {}
-        for src, res in zip(AMC_SOURCES, results):
-            if isinstance(res, Exception):
-                log.error(f"[{src['name']}] {res}")
-            elif res:
-                new_db.update(res)
-        holdings_db.clear(); holdings_db.update(new_db)
-        last_refresh = datetime.utcnow()
-        log.info(f"=== Done: {len(holdings_db)} funds ===")
-
-async def scheduler():
-    await refresh_all()
-    while True:
-        now = datetime.utcnow()
-        nxt = now.replace(day=10, hour=3, minute=30, second=0, microsecond=0)
-        if nxt.month == 12:
-            nxt = nxt.replace(year=nxt.year+1, month=1)
-        else:
-            nxt = nxt.replace(month=nxt.month+1)
-        if nxt <= now: nxt = nxt.replace(month=nxt.month+1 if nxt.month<12 else 1)
-        await asyncio.sleep((nxt-now).total_seconds())
-        await refresh_all()
-
+# ── Startup ────────────────────────────────────────────────────────────────
 @app.on_event("startup")
-async def startup(): asyncio.create_task(scheduler())
+async def startup():
+    load_db()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ROUTES
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Auth helper ────────────────────────────────────────────────────────────
+def check_secret(secret: str):
+    expected = os.environ.get("UPLOAD_SECRET", "")
+    if expected and secret != expected:
+        raise HTTPException(403, "Invalid secret — set UPLOAD_SECRET env var on Render")
+
+# ── Routes ─────────────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
-    return {"service":"MF Holdings API","funds":len(holdings_db),
-            "last_refresh":last_refresh.isoformat() if last_refresh else None}
+    return {
+        "service":      "MF Holdings API",
+        "funds":        len(holdings_db),
+        "last_updated": max((v.get("uploaded_at","") for v in holdings_db.values()), default=None),
+        "endpoints": {
+            "GET  /health":                   "health check",
+            "GET  /funds":                    "list all loaded funds",
+            "GET  /holdings?fund=<name>":     "get holdings for a fund",
+            "GET  /search?q=<query>":         "search fund names",
+            "POST /upload":                   "upload AMC Excel (multipart: file + amc + secret)",
+            "DELETE /fund?key=<key>&secret=": "remove a fund",
+        }
+    }
 
 @app.get("/health")
 async def health():
-    return {"status":"ok","funds":len(holdings_db),
-            "last_refresh":last_refresh.isoformat() if last_refresh else None}
+    return {
+        "status": "ok",
+        "funds":  len(holdings_db),
+        "amcs":   list({v["amc"] for v in holdings_db.values()}),
+    }
 
 @app.get("/funds")
-async def list_funds(amc: Optional[str]=None):
-    out = [{"name":v["fund_name"],"amc":v["amc"],"key":k,"count":v["count"]}
-           for k,v in holdings_db.items()
-           if not amc or amc.lower() in v.get("amc","").lower()]
-    return {"total":len(out),"funds":sorted(out,key=lambda x:(x["amc"],x["name"]))}
+async def list_funds(amc: Optional[str] = None):
+    out = [
+        {"name": v["fund_name"], "amc": v["amc"], "key": k,
+         "count": v["count"], "uploaded_at": v.get("uploaded_at","")}
+        for k,v in holdings_db.items()
+        if not amc or amc.lower() in v.get("amc","").lower()
+    ]
+    out.sort(key=lambda x: (x["amc"], x["name"]))
+    return {"total": len(out), "funds": out}
 
 @app.get("/holdings")
-async def holdings(fund: str = Query(..., min_length=2)):
-    if not holdings_db: raise HTTPException(503,"Loading, retry in 60s")
+async def get_holdings(fund: str = Query(..., min_length=2)):
+    if not holdings_db:
+        raise HTTPException(503, "No data loaded yet — upload an AMC Excel via POST /upload")
     q = norm(fund)
     if q in holdings_db: return holdings_db[q]
+
+    # Fuzzy match
     qw = set(q.split())
     best_s, best_v = 0.0, None
-    for k,v in holdings_db.items():
-        ov = len(qw & set(k.split()))
-        s  = ov / max(len(qw),len(k.split()),1)
-        if q in k: s+=0.6
-        if k in q: s+=0.4
-        if s > best_s: best_s,best_v = s,v
-    if best_v and best_s >= 0.3: return best_v
-    raise HTTPException(404, f"Not found: '{fund}' — try /search?q=...")
+    for k, v in holdings_db.items():
+        kw = set(k.split())
+        s  = len(qw & kw) / max(len(qw), len(kw), 1)
+        if q in k: s += 0.6
+        if k in q: s += 0.4
+        if s > best_s: best_s, best_v = s, v
+    if best_v and best_s >= 0.25: return best_v
+    raise HTTPException(404, f"Fund not found: '{fund}' — try /search?q=...")
 
 @app.get("/search")
 async def search(q: str = Query(..., min_length=2)):
     qn = norm(q); qw = set(qn.split()); res = []
-    for k,v in holdings_db.items():
-        ov = len(qw & set(k.split()))
-        s  = ov/max(len(qw),len(k.split()),1)
-        if qn in k: s+=0.6
-        if k in qn: s+=0.4
-        if s>0: res.append({"score":round(s,2),"name":v["fund_name"],"amc":v["amc"],"key":k,"count":v["count"]})
-    res.sort(key=lambda x:-x["score"])
-    return {"query":q,"results":res[:15]}
+    for k, v in holdings_db.items():
+        kw = set(k.split())
+        s  = len(qw & kw) / max(len(qw), len(kw), 1)
+        if qn in k: s += 0.6
+        if k in qn: s += 0.4
+        if s > 0:
+            res.append({"score": round(s,2), "name": v["fund_name"],
+                        "amc": v["amc"], "key": k, "count": v["count"]})
+    res.sort(key=lambda x: -x["score"])
+    return {"query": q, "results": res[:15]}
 
-@app.post("/refresh")
-async def manual_refresh(secret: str=""):
-    exp = os.environ.get("REFRESH_SECRET","")
-    if exp and secret!=exp: raise HTTPException(403,"Invalid secret")
-    asyncio.create_task(refresh_all())
-    return {"status":"refresh started","current_funds":len(holdings_db)}
+@app.post("/upload")
+async def upload_excel(
+    file:   UploadFile = File(...),
+    amc:    str        = Form(...),
+    secret: str        = Form(default=""),
+):
+    """
+    Upload an AMC portfolio Excel.
+    Form fields: file (xlsx), amc (AMC name), secret (UPLOAD_SECRET env var).
+    """
+    check_secret(secret)
+    if not file.filename.endswith(('.xlsx', '.xls', '.csv')):
+        raise HTTPException(400, "Only .xlsx / .xls files accepted")
+
+    raw     = await file.read()
+    parsed  = parse_excel(raw, amc.strip())
+    if not parsed:
+        raise HTTPException(422, "No fund data found — check the Excel format")
+
+    holdings_db.update(parsed)
+    save_db()
+    log.info(f"Uploaded {len(parsed)} funds for {amc}")
+    return {
+        "status":       "ok",
+        "amc":          amc,
+        "funds_added":  len(parsed),
+        "funds_total":  len(holdings_db),
+        "funds":        [{"name": v["fund_name"], "count": v["count"]} for v in parsed.values()],
+    }
+
+@app.delete("/fund")
+async def delete_fund(key: str, secret: str = ""):
+    check_secret(secret)
+    if key not in holdings_db:
+        raise HTTPException(404, f"Key not found: {key}")
+    del holdings_db[key]
+    save_db()
+    return {"status": "deleted", "key": key, "funds_remaining": len(holdings_db)}
+
+@app.delete("/amc")
+async def delete_amc(amc: str, secret: str = ""):
+    check_secret(secret)
+    keys = [k for k,v in holdings_db.items() if v.get("amc","").lower() == amc.lower()]
+    for k in keys: del holdings_db[k]
+    save_db()
+    return {"status": "deleted", "amc": amc, "removed": len(keys), "funds_remaining": len(holdings_db)}
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0",
-                port=int(os.environ.get("PORT",8000)), reload=False)
+                port=int(os.environ.get("PORT", 8000)), reload=False)
