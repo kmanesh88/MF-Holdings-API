@@ -18,7 +18,14 @@ import uvicorn
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-app = FastAPI(title="MF Holdings API", version="5.0.0")
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app):
+    load_db()
+    yield
+
+app = FastAPI(title="MF Holdings API", version="5.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
                    allow_methods=["GET","POST","DELETE"], allow_headers=["*"])
 
@@ -26,6 +33,7 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", "/tmp/mf_data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_FILE  = DATA_DIR / "holdings.json"
 holdings_db: dict = {}
+_amfi_cap_cache: dict = {}  # module-level cache for /amfi-cap endpoint
 
 def save_db():
     try: DB_FILE.write_text(json.dumps(holdings_db, ensure_ascii=False))
@@ -375,8 +383,7 @@ def process_upload(raw: bytes, filename: str, amc_name: str) -> dict:
     return result
 
 # ── App startup & auth ────────────────────────────────────────────────────
-@app.on_event("startup")
-async def startup(): load_db()
+
 
 def check_secret(secret: str):
     exp = os.environ.get("UPLOAD_SECRET","")
@@ -481,16 +488,16 @@ async def delete_fund(key: str, secret: str=""):
 @app.get("/amfi-cap")
 async def amfi_cap():
     """
-    Proxy + parse AMFI's biannual large/mid/small cap classification Excel.
+    Proxy + parse AMFI biannual cap classification Excel.
     Returns { large: ["HDFC BANK", ...], mid: [...], updated: "Dec 2025" }
-    Cached in memory for 12 hours to avoid hammering AMFI.
+    Cached in memory for 12 hours.
     """
     import time, urllib.request
 
-    # In-memory cache
-    cache = getattr(amfi_cap, "_cache", None)
-    if cache and (time.time() - cache["ts"]) < 43200:  # 12h
-        return cache["data"]
+    # Use module-level cache
+    global _amfi_cap_cache
+    if _amfi_cap_cache and (time.time() - _amfi_cap_cache.get("ts", 0)) < 43200:
+        return _amfi_cap_cache["data"]
 
     URLS = [
         ("Dec 2025", "https://www.amfiindia.com/Themes/Theme1/downloads/AverageMarketCapitalization31Dec2025.xlsx"),
@@ -553,7 +560,7 @@ async def amfi_cap():
             if len(large) >= 90:  # sanity check
                 result = {"large": large, "mid": mid, "small": small,
                           "updated": label, "total": len(large)+len(mid)+len(small)}
-                amfi_cap._cache = {"ts": time.time(), "data": result}
+                _amfi_cap_cache = {"ts": time.time(), "data": result}
                 log.info(f"AMFI cap loaded: {len(large)}L {len(mid)}M {len(small)}S ({label})")
                 return result
 
@@ -562,13 +569,6 @@ async def amfi_cap():
 
     raise HTTPException(503, "AMFI data temporarily unavailable")
 
-
-if __name__ == "__main__":
-    uvicorn.run("main:app",host="0.0.0.0",port=int(os.environ.get("PORT",8000)),reload=False)
-
-
-    del holdings_db[key]; save_db()
-    return {"deleted":key,"funds_remaining":len(holdings_db)}
 
 if __name__ == "__main__":
     uvicorn.run("main:app",host="0.0.0.0",port=int(os.environ.get("PORT",8000)),reload=False)
