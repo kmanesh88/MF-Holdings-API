@@ -478,8 +478,94 @@ async def delete_fund(key: str, secret: str=""):
     del holdings_db[key]; save_db()
     return {"deleted":key,"funds_remaining":len(holdings_db)}
 
+@app.get("/amfi-cap")
+async def amfi_cap():
+    """
+    Proxy + parse AMFI's biannual large/mid/small cap classification Excel.
+    Returns { large: ["HDFC BANK", ...], mid: [...], updated: "Dec 2025" }
+    Cached in memory for 12 hours to avoid hammering AMFI.
+    """
+    import time, urllib.request
+
+    # In-memory cache
+    cache = getattr(amfi_cap, "_cache", None)
+    if cache and (time.time() - cache["ts"]) < 43200:  # 12h
+        return cache["data"]
+
+    URLS = [
+        ("Dec 2025", "https://www.amfiindia.com/Themes/Theme1/downloads/AverageMarketCapitalization31Dec2025.xlsx"),
+        ("Jun 2025", "https://www.amfiindia.com/Themes/Theme1/downloads/AverageMarketCapitalization30Jun2025.xlsx"),
+    ]
+
+    def norm_name(n):
+        n = str(n).upper().strip()
+        n = re.sub(r'\bLTD\.?\b|\bLIMITED\b|\bPVT\.?\b', '', n)
+        n = re.sub(r'[.\-,()]', ' ', n)
+        return re.sub(r'\s+', ' ', n).strip()
+
+    for label, url in URLS:
+        try:
+            req = urllib.request.Request(url, headers={
+                'User-Agent': 'Mozilla/5.0',
+                'Referer': 'https://www.amfiindia.com/'
+            })
+            raw = urllib.request.urlopen(req, timeout=20).read()
+            wb  = openpyxl.load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+            ws  = wb.active
+            rows = list(ws.iter_rows(values_only=True))
+
+            # Find header row (has "Company" and "Category" or rank columns)
+            name_col = cat_col = rank_col = -1
+            hdr_row = -1
+            for i, row in enumerate(rows[:10]):
+                cells = [str(c or '').lower().strip() for c in row]
+                nc = next((j for j, c in enumerate(cells) if 'company' in c or 'name' in c), -1)
+                cc = next((j for j, c in enumerate(cells) if 'categor' in c or 'large' in c), -1)
+                rc = next((j for j, c in enumerate(cells) if c in ('rank', 'sr', 'sr.', 'sl', 'no', 'no.')), -1)
+                if nc >= 0:
+                    name_col = nc; cat_col = cc; rank_col = rc; hdr_row = i
+                    break
+
+            if name_col < 0:
+                log.warning(f"AMFI: header not found in {label}")
+                continue
+
+            large, mid, small = [], [], []
+            for row in rows[hdr_row + 1:]:
+                if not row or not row[name_col]: continue
+                name = norm_name(row[name_col])
+                if not name or len(name) < 3: continue
+
+                # Determine category
+                if cat_col >= 0:
+                    cat = str(row[cat_col] or '').lower()
+                    if 'large' in cat:   large.append(name)
+                    elif 'mid' in cat:   mid.append(name)
+                    elif 'small' in cat: small.append(name)
+                elif rank_col >= 0:
+                    try:
+                        rank = int(row[rank_col])
+                        if rank <= 100:  large.append(name)
+                        elif rank <= 250: mid.append(name)
+                        else:            small.append(name)
+                    except: pass
+
+            if len(large) >= 90:  # sanity check
+                result = {"large": large, "mid": mid, "small": small,
+                          "updated": label, "total": len(large)+len(mid)+len(small)}
+                amfi_cap._cache = {"ts": time.time(), "data": result}
+                log.info(f"AMFI cap loaded: {len(large)}L {len(mid)}M {len(small)}S ({label})")
+                return result
+
+        except Exception as e:
+            log.warning(f"AMFI fetch failed ({label}): {e}")
+
+    raise HTTPException(503, "AMFI data temporarily unavailable")
+
+
 if __name__ == "__main__":
     uvicorn.run("main:app",host="0.0.0.0",port=int(os.environ.get("PORT",8000)),reload=False)
+
 
     del holdings_db[key]; save_db()
     return {"deleted":key,"funds_remaining":len(holdings_db)}
