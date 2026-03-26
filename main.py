@@ -92,6 +92,9 @@ def parse_advisorkhoj(wb, amc_name: str) -> dict:
         PCT_COL    = 6
 
         holdings = []
+        cash_pct = 0.0
+        CASH_ROWS = re.compile(r'^(treps?|triparty\s*repo|reverse\s*repo|cblo|'
+                               r'cash\s*and\s*other|net\s*current|total\s*for\s*money)', re.I)
         for row in rows[4:]:  # data starts row 5 (index 4)
             if len(row) <= PCT_COL: continue
             isin    = str(row[ISIN_COL] or '').strip()
@@ -99,10 +102,19 @@ def parse_advisorkhoj(wb, amc_name: str) -> dict:
             sector  = str(row[SECTOR_COL] or '').strip()
             pct_raw = row[PCT_COL]
 
-            # Must have valid ISIN (IN + 10 alphanumeric)
-            if not VALID_ISIN.match(isin): continue
+            if not name: continue
+
+            # Capture cash/TREPS rows (no valid ISIN)
+            if not VALID_ISIN.match(isin):
+                if CASH_ROWS.match(name):
+                    try:
+                        p = float(pct_raw) * 100
+                        if 0 < p < 50: cash_pct += p
+                    except: pass
+                continue
+
             # Skip known non-holding rows by name
-            if not name or SKIP_ROWS.match(name): continue
+            if SKIP_ROWS.match(name): continue
 
             # % is stored as decimal — multiply by 100
             try:
@@ -126,10 +138,11 @@ def parse_advisorkhoj(wb, amc_name: str) -> dict:
                 "amc":         amc_name,
                 "holdings":    holdings,
                 "count":       len(holdings),
+                "cashPct":     cash_pct,
                 "uploaded_at": datetime.utcnow().isoformat(),
                 "format":      "advisorkhoj",
             }
-            log.debug(f"  [{sname}] {fund_name}: {len(holdings)} holdings")
+            log.debug(f"  [{sname}] {fund_name}: {len(holdings)} holdings, cash={cash_pct:.2f}%")
 
     return out
 
@@ -462,6 +475,12 @@ async def delete_amc(amc: str, secret: str=""):
 async def delete_fund(key: str, secret: str=""):
     check_secret(secret)
     if key not in holdings_db: raise HTTPException(404,f"Key not found: {key}")
+    del holdings_db[key]; save_db()
+    return {"deleted":key,"funds_remaining":len(holdings_db)}
+
+if __name__ == "__main__":
+    uvicorn.run("main:app",host="0.0.0.0",port=int(os.environ.get("PORT",8000)),reload=False)
+
     del holdings_db[key]; save_db()
     return {"deleted":key,"funds_remaining":len(holdings_db)}
 
