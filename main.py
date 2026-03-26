@@ -268,6 +268,51 @@ def parse_kotak(wb, amc_name: str) -> dict:
                         "format":"kotak"}
     return out
 
+
+# ── FORMAT 4: ICICI Prudential per-fund Excel (one sheet per file) ────────
+# Row 1 col[1]: AMC name, Row 2 col[1]: Fund name, Row 3: Period, Row 4: Headers
+# Cols: [1]=Name, [2]=ISIN, [4]=Sector, [7]=% to Nav (decimal, ×100)
+def is_icici_format(wb) -> bool:
+    ws = wb[wb.sheetnames[0]]
+    rows = list(ws.iter_rows(max_row=4, values_only=True))
+    if len(rows) < 4: return False
+    amc = str(rows[0][1] or '').strip().lower() if len(rows[0]) > 1 else ''
+    hdr = [str(c or '').lower() for c in rows[3]] if len(rows) > 3 else []
+    return ('icici' in amc or 'mutual fund' in amc) and any('% to nav' in h or '% nav' in h for h in hdr)
+
+def parse_icici(wb, amc_name: str, filename: str = "") -> dict:
+    out = {}
+    ws   = wb[wb.sheetnames[0]]
+    rows = list(ws.iter_rows(values_only=True))
+    if len(rows) < 5: return out
+
+    # Fund name from row 2, col 1
+    fund_name = str(rows[1][1] or '').strip() if len(rows) > 1 and len(rows[1]) > 1 else ''
+    if not fund_name:
+        fund_name = re.sub(r'\.xlsx?$', '', filename, flags=re.I).strip()
+
+    holdings = []
+    for row in rows[4:]:
+        if len(row) < 8: continue
+        name    = str(row[1] or '').strip()
+        isin    = str(row[2] or '').strip()
+        sector  = str(row[4] or '').strip()
+        pct_raw = row[7]
+        if not VALID_ISIN.match(isin): continue
+        if not name or len(name) < 2: continue
+        try: pct = float(pct_raw) * 100
+        except: continue
+        if pct <= 0 or pct > 100: continue
+        holdings.append({"name":name,"isin":isin,"sector":sector,"pct":round(pct,4)})
+
+    if len(holdings) >= 2:
+        key = norm(fund_name)
+        out[key] = {"fund_name":fund_name,"amc":amc_name,
+                    "holdings":holdings,"count":len(holdings),
+                    "uploaded_at":datetime.utcnow().isoformat(),
+                    "format":"icici"}
+    return out
+
 # ── ZIP extractor ─────────────────────────────────────────────────────────
 def extract_excels_from_zip(raw: bytes) -> list:
     results = []
@@ -306,6 +351,9 @@ def process_upload(raw: bytes, filename: str, amc_name: str) -> dict:
     elif is_kotak_format(wb):
         log.info(f"'{filename}': Kotak/SEBI multi-sheet format detected")
         result = parse_kotak(wb, amc_name)
+    elif is_icici_format(wb):
+        log.info(f"'{filename}': ICICI per-fund format detected")
+        result = parse_icici(wb, amc_name, filename)
     else:
         log.info(f"'{filename}': SEBI standard format")
         result = parse_sebi_standard(wb, amc_name, filename)
