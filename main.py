@@ -216,6 +216,58 @@ def parse_sebi_standard(wb, amc_name: str, filename: str = "") -> dict:
                             "format":"sebi_standard"}
     return out
 
+
+# ── FORMAT 3: Kotak/SEBI multi-sheet consolidated Excel ──────────────────
+# No Index sheet; each sheet = one fund
+# Row 1 col[2]: "Portfolio of <Fund Name> as on DD-Mon-YYYY"
+# Row 2: headers (Name|None|None|ISIN|Industry|Yield|Qty|MktVal|%NAV)
+# Data: col[2]=Name, col[3]=ISIN, col[4]=Sector, col[8]=% (actual %, not decimal)
+def is_kotak_format(wb) -> bool:
+    """Detect by checking row1 of first sheet for 'Portfolio of' pattern."""
+    for sname in wb.sheetnames[:3]:
+        ws = wb[sname]
+        rows = list(ws.iter_rows(max_row=2, values_only=True))
+        if rows and len(rows[0]) > 2:
+            cell = str(rows[0][2] or '').strip()
+            if re.match(r'Portfolio of .+ as on', cell, re.I):
+                return True
+    return False
+
+def parse_kotak(wb, amc_name: str) -> dict:
+    out = {}
+    for sname in wb.sheetnames:
+        ws   = wb[sname]
+        rows = list(ws.iter_rows(values_only=True))
+        if len(rows) < 3: continue
+
+        # Fund name from row 1 col 2
+        fund_raw  = str(rows[0][2] or '').strip() if len(rows[0]) > 2 else ''
+        m         = re.match(r'Portfolio of (.+?)\s+as on', fund_raw, re.I)
+        fund_name = m.group(1).strip() if m else (fund_raw or sname)
+        if not fund_name or fund_name == sname: continue
+
+        holdings = []
+        for row in rows[2:]:
+            if len(row) < 9: continue
+            name    = str(row[2] or '').strip()
+            isin    = str(row[3] or '').strip()
+            sector  = str(row[4] or '').strip()
+            pct_raw = row[8]
+            if not VALID_ISIN.match(isin): continue
+            if not name or len(name) < 2: continue
+            try: pct = float(pct_raw)
+            except: continue
+            if pct <= 0 or pct > 100: continue
+            holdings.append({"name":name,"isin":isin,"sector":sector,"pct":round(pct,4)})
+
+        if len(holdings) >= 2:
+            key = norm(fund_name)
+            out[key] = {"fund_name":fund_name,"amc":amc_name,
+                        "holdings":holdings,"count":len(holdings),
+                        "uploaded_at":datetime.utcnow().isoformat(),
+                        "format":"kotak"}
+    return out
+
 # ── ZIP extractor ─────────────────────────────────────────────────────────
 def extract_excels_from_zip(raw: bytes) -> list:
     results = []
@@ -251,6 +303,9 @@ def process_upload(raw: bytes, filename: str, amc_name: str) -> dict:
     if is_advisorkhoj_format(wb):
         log.info(f"'{filename}': Advisorkhoj format detected")
         result = parse_advisorkhoj(wb, amc_name)
+    elif is_kotak_format(wb):
+        log.info(f"'{filename}': Kotak/SEBI multi-sheet format detected")
+        result = parse_kotak(wb, amc_name)
     else:
         log.info(f"'{filename}': SEBI standard format")
         result = parse_sebi_standard(wb, amc_name, filename)
