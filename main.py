@@ -571,14 +571,16 @@ async def amfi_cap():
 
 
 # ── Market Monitor endpoint ───────────────────────────────────────────────
-import anthropic as _anthropic
-
 @app.get("/market-data")
 async def market_data(stocks: str = ""):
     """
     Uses Claude to generate current Indian market data summary.
     stocks: comma-separated list of portfolio stock names for news context
     """
+    try:
+        import anthropic as _anthropic
+    except ImportError:
+        raise HTTPException(503, "anthropic package not installed. Check requirements.txt.")
     from datetime import date
     today = date.today().strftime("%d %B %Y")
     
@@ -624,3 +626,4 @@ Return ONLY valid JSON, no markdown, no explanation. sentiment values: Positive,
 
 if __name__ == "__main__":
     uvicorn.run("main:app",host="0.0.0.0",port=int(os.environ.get("PORT",8000)),reload=False)
+
