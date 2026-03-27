@@ -594,21 +594,29 @@ Provide a structured JSON response with the following for Indian markets:
 
 Return ONLY valid JSON, no markdown, no explanation. sentiment values: Positive, Negative, Neutral."""
 
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        raise HTTPException(503, "ANTHROPIC_API_KEY not set on server. Add it in Render dashboard → Environment.")
+    
     try:
-        client = _anthropic.Anthropic()
+        client = _anthropic.Anthropic(api_key=api_key)
         msg = client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=1500,
             messages=[{"role": "user", "content": prompt}]
         )
-        text = msg.content[0].text
-        import json
-        # Strip markdown if present
-        text = text.strip()
+        text = msg.content[0].text.strip()
+        import json as _json
         if text.startswith("```"):
-            text = re.sub(r"^```json?\n?|```$", "", text, flags=re.M).strip()
-        data = json.loads(text)
+            import re as _re
+            text = _re.sub(r"^```json?\n?|```$", "", text, flags=_re.M).strip()
+        data = _json.loads(text)
         return data
+    except _anthropic.AuthenticationError:
+        raise HTTPException(503, "Invalid ANTHROPIC_API_KEY. Check the key in Render dashboard.")
+    except _json.JSONDecodeError as e:
+        log.error(f"market_data JSON parse error: {e}, text: {text[:200]}")
+        raise HTTPException(500, f"Invalid response from AI: {str(e)[:80]}")
     except Exception as e:
         log.error(f"market_data error: {e}")
         raise HTTPException(500, f"Market data unavailable: {str(e)[:100]}")
