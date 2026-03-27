@@ -574,51 +574,65 @@ async def amfi_cap():
 @app.get("/market-data")
 async def market_data(stocks: str = ""):
     """
-    Uses Claude to generate current Indian market data summary.
-    stocks: comma-separated list of portfolio stock names for news context
+    Uses Claude Haiku to generate Indian market data summary.
+    Uses httpx async to avoid blocking Render's 30s timeout.
     """
-    try:
-        import anthropic as _anthropic
-    except ImportError:
-        raise HTTPException(503, "anthropic package not installed. Check requirements.txt.")
+    import httpx, json as _json
     from datetime import date
-    today = date.today().strftime("%d %B %Y")
-    
-    prompt = f"""You are a market data assistant for an Indian mutual fund portfolio analyser. Today is {today}.
-
-Provide a structured JSON response with the following for Indian markets:
-
-1. indices: Array of {{name, value, change, changePct}} for: NIFTY 50, SENSEX, NIFTY MIDCAP 150, NIFTY SMALLCAP 250, NIFTY BANK, INDIA VIX. Use your best knowledge of recent values.
-2. fii_dii: {{date, fii_net_crore, dii_net_crore, fii_buy, fii_sell, dii_buy, dii_sell}} — recent FII/DII provisional data in crores
-3. earnings: Array of {{company, result_date, revenue_growth_pct, profit_growth_pct, beat_miss}} for 6 major companies with recent results
-4. market_news: Array of {{headline, category, sentiment}} — 6 key market-moving news items (macro, RBI, global, sector)
-5. portfolio_news: Array of {{stock, headline, sentiment}} — news for these stocks: {stocks or "HDFC Bank, Reliance Industries, Infosys, ICICI Bank, Axis Bank, Larsen & Toubro"}
-
-Return ONLY valid JSON, no markdown, no explanation. sentiment values: Positive, Negative, Neutral."""
 
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not api_key:
-        raise HTTPException(503, "ANTHROPIC_API_KEY not set on server. Add it in Render dashboard → Environment.")
-    
+        raise HTTPException(503, "ANTHROPIC_API_KEY not set. Add it in Render → Environment.")
+
+    today = date.today().strftime("%d %B %Y")
+    stock_list = stocks or "HDFC Bank, Reliance Industries, Infosys, ICICI Bank, Axis Bank"
+
+    # Short prompt — faster response, less chance of timeout
+    prompt = f"""Today is {today}. Return a JSON object for Indian markets with these exact keys:
+{{
+  "indices": [{{"name":"NIFTY 50","value":0,"change":0,"changePct":0}}, ...] (6 indices: NIFTY 50, SENSEX, NIFTY MIDCAP 150, NIFTY SMALLCAP 250, NIFTY BANK, INDIA VIX),
+  "fii_dii": {{"date":"DD Mon YYYY","fii_net_crore":0,"dii_net_crore":0,"fii_buy":0,"fii_sell":0,"dii_buy":0,"dii_sell":0}},
+  "earnings": [{{"company":"","result_date":"","revenue_growth_pct":0,"profit_growth_pct":0,"beat_miss":"Beat"}}] (5 recent results),
+  "market_news": [{{"headline":"","category":"","sentiment":"Positive"}}] (5 items),
+  "portfolio_news": [{{"stock":"","headline":"","sentiment":"Positive"}}] (for: {stock_list})
+}}
+Use your knowledge of recent Indian market data. Return ONLY valid JSON."""
+
     try:
-        client = _anthropic.Anthropic(api_key=api_key)
-        msg = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=1500,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        text = msg.content[0].text.strip()
-        import json as _json
+        async with httpx.AsyncClient(timeout=25.0) as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": "claude-haiku-4-5-20251001",
+                    "max_tokens": 1200,
+                    "messages": [{"role": "user", "content": prompt}]
+                }
+            )
+
+        if resp.status_code == 401:
+            raise HTTPException(503, "Invalid ANTHROPIC_API_KEY.")
+        if resp.status_code != 200:
+            raise HTTPException(500, f"Anthropic API error {resp.status_code}")
+
+        data = resp.json()
+        text = data["content"][0]["text"].strip()
         if text.startswith("```"):
-            import re as _re
-            text = _re.sub(r"^```json?\n?|```$", "", text, flags=_re.M).strip()
-        data = _json.loads(text)
-        return data
-    except _anthropic.AuthenticationError:
-        raise HTTPException(503, "Invalid ANTHROPIC_API_KEY. Check the key in Render dashboard.")
+            text = re.sub(r"^```json?\n?|```$", "", text, flags=re.M).strip()
+
+        return _json.loads(text)
+
+    except httpx.TimeoutException:
+        raise HTTPException(504, "AI request timed out. Try again.")
     except _json.JSONDecodeError as e:
-        log.error(f"market_data JSON parse error: {e}, text: {text[:200]}")
-        raise HTTPException(500, f"Invalid response from AI: {str(e)[:80]}")
+        log.error(f"market_data JSON error: {e}")
+        raise HTTPException(500, "AI returned invalid JSON. Try again.")
+    except HTTPException:
+        raise
     except Exception as e:
         log.error(f"market_data error: {e}")
         raise HTTPException(500, f"Market data unavailable: {str(e)[:100]}")
