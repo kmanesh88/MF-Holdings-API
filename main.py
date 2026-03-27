@@ -570,72 +570,84 @@ async def amfi_cap():
     raise HTTPException(503, "AMFI data temporarily unavailable")
 
 
-# ── Market Monitor endpoint ───────────────────────────────────────────────
-@app.get("/market-data")
-async def market_data(stocks: str = ""):
-    """
-    Uses Claude Haiku to generate Indian market data summary.
-    Uses httpx async to avoid blocking Render's 30s timeout.
-    """
-    import httpx, json as _json
+# ── Market Monitor endpoint ──────────────────────────────────────────
+_market_cache: dict = {"data": None, "ts": 0.0, "status": "idle"}
+
+async def _fetch_market_bg(api_key: str, stock_list: str):
+    """Calls Claude Haiku in background; populates _market_cache."""
+    import httpx, json as _j, time
     from datetime import date
-
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
-        raise HTTPException(503, "ANTHROPIC_API_KEY not set. Add it in Render → Environment.")
-
+    _market_cache["status"] = "fetching"
     today = date.today().strftime("%d %B %Y")
-    stock_list = stocks or "HDFC Bank, Reliance Industries, Infosys, ICICI Bank, Axis Bank"
-
-    # Short prompt — faster response, less chance of timeout
-    prompt = f"""Today is {today}. Return a JSON object for Indian markets with these exact keys:
-{{
-  "indices": [{{"name":"NIFTY 50","value":0,"change":0,"changePct":0}}, ...] (6 indices: NIFTY 50, SENSEX, NIFTY MIDCAP 150, NIFTY SMALLCAP 250, NIFTY BANK, INDIA VIX),
-  "fii_dii": {{"date":"DD Mon YYYY","fii_net_crore":0,"dii_net_crore":0,"fii_buy":0,"fii_sell":0,"dii_buy":0,"dii_sell":0}},
-  "earnings": [{{"company":"","result_date":"","revenue_growth_pct":0,"profit_growth_pct":0,"beat_miss":"Beat"}}] (5 recent results),
-  "market_news": [{{"headline":"","category":"","sentiment":"Positive"}}] (5 items),
-  "portfolio_news": [{{"stock":"","headline":"","sentiment":"Positive"}}] (for: {stock_list})
-}}
-Use your knowledge of recent Indian market data. Return ONLY valid JSON."""
-
+    prompt = (
+        f"Today is {today}. Return ONLY a valid JSON object (no markdown, no explanation) "
+        "with these keys for Indian markets:\n"
+        '{"indices":[{"name":"NIFTY 50","value":0,"change":0,"changePct":0},'
+        '{"name":"SENSEX","value":0,"change":0,"changePct":0},'
+        '{"name":"NIFTY MIDCAP 150","value":0,"change":0,"changePct":0},'
+        '{"name":"NIFTY SMALLCAP 250","value":0,"change":0,"changePct":0},'
+        '{"name":"NIFTY BANK","value":0,"change":0,"changePct":0},'
+        '{"name":"INDIA VIX","value":0,"change":0,"changePct":0}],'
+        '"fii_dii":{"date":"","fii_net_crore":0,"dii_net_crore":0,"fii_buy":0,"fii_sell":0,"dii_buy":0,"dii_sell":0},'
+        '"earnings":[{"company":"","result_date":"","revenue_growth_pct":0,"profit_growth_pct":0,"beat_miss":"Beat"}],'
+        '"market_news":[{"headline":"","category":"","sentiment":"Positive"}],'
+        f'"portfolio_news":[{{"stock":"","headline":"","sentiment":"Positive"}}]}}'
+        f"\nFill all values with real recent data. stocks of interest: {stock_list}"
+    )
     try:
-        async with httpx.AsyncClient(timeout=25.0) as client:
+        async with httpx.AsyncClient(timeout=28.0) as client:
             resp = await client.post(
                 "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": api_key,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-                json={
-                    "model": "claude-haiku-4-5-20251001",
-                    "max_tokens": 1200,
-                    "messages": [{"role": "user", "content": prompt}]
-                }
+                headers={"x-api-key": api_key,
+                         "anthropic-version": "2023-06-01",
+                         "content-type": "application/json"},
+                json={"model": "claude-haiku-4-5-20251001",
+                      "max_tokens": 1200,
+                      "messages": [{"role": "user", "content": prompt}]}
             )
-
-        if resp.status_code == 401:
-            raise HTTPException(503, "Invalid ANTHROPIC_API_KEY.")
-        if resp.status_code != 200:
-            raise HTTPException(500, f"Anthropic API error {resp.status_code}")
-
-        data = resp.json()
-        text = data["content"][0]["text"].strip()
-        if text.startswith("```"):
+        if resp.status_code == 200:
+            text = resp.json()["content"][0]["text"].strip()
             text = re.sub(r"```[^\n]*\n?|```", "", text).strip()
-
-        return _json.loads(text)
-
-    except httpx.TimeoutException:
-        raise HTTPException(504, "AI request timed out. Try again.")
-    except _json.JSONDecodeError as e:
-        log.error(f"market_data JSON error: {e}")
-        raise HTTPException(500, "AI returned invalid JSON. Try again.")
-    except HTTPException:
-        raise
+            _market_cache["data"]   = _j.loads(text)
+            _market_cache["ts"]     = time.time()
+            _market_cache["status"] = "ready"
+            log.info("market_data cache updated OK")
+        else:
+            log.error(f"Anthropic {resp.status_code}: {resp.text[:120]}")
+            _market_cache["status"] = "error"
     except Exception as e:
-        log.error(f"market_data error: {e}")
-        raise HTTPException(500, f"Market data unavailable: {str(e)[:100]}")
+        log.error(f"_fetch_market_bg error: {e}")
+        _market_cache["status"] = "error"
+
+
+@app.get("/market-data")
+async def market_data(stocks: str = ""):
+    import asyncio, time
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        raise HTTPException(503, "ANTHROPIC_API_KEY not configured on server.")
+
+    age = time.time() - _market_cache["ts"]
+
+    # Serve cache if fresh (< 30 min)
+    if _market_cache["data"] and age < 1800:
+        return _market_cache["data"]
+
+    # Trigger background fetch if not already running
+    if _market_cache["status"] != "fetching":
+        stock_list = stocks or "HDFC Bank, Reliance, Infosys, ICICI Bank, Axis Bank"
+        asyncio.create_task(_fetch_market_bg(api_key, stock_list))
+
+    # Return stale data if available, else loading sentinel
+    if _market_cache["data"]:
+        return _market_cache["data"]
+
+    return {
+        "status": "loading",
+        "message": "Generating market data, please refresh in 20 seconds",
+        "indices": [], "fii_dii": {}, "earnings": [],
+        "market_news": [], "portfolio_news": []
+    }
 
 
 if __name__ == "__main__":
