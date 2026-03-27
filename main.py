@@ -102,7 +102,7 @@ def parse_advisorkhoj(wb, amc_name: str) -> dict:
         holdings = []
         cash_pct = 0.0
         CASH_ROWS = re.compile(r'^(treps?|triparty\s*repo|reverse\s*repo|cblo|'
-                               r'cash\s*and\s*other|net\s*current|total\s*for\s*money)', re.I)
+                               r'cash\s*and\s*other\s*net|net\s*current\s*asset)', re.I)
         for row in rows[4:]:  # data starts row 5 (index 4)
             if len(row) <= PCT_COL: continue
             isin    = str(row[ISIN_COL] or '').strip()
@@ -572,3 +572,4 @@ async def amfi_cap():
 
 if __name__ == "__main__":
     uvicorn.run("main:app",host="0.0.0.0",port=int(os.environ.get("PORT",8000)),reload=False)
+
