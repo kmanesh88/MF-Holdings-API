@@ -5,7 +5,7 @@ Accepts: Advisorkhoj consolidated Excel, standard SEBI format Excel,
 Deploy free on Render.com.
 """
 
-import os, re, io, logging, json, zipfile
+import os, re, io, logging, json, zipfile, httpx
 from datetime import datetime
 from typing import Optional, List
 from pathlib import Path
@@ -571,11 +571,37 @@ async def amfi_cap():
 
 
 # ── Market Monitor endpoint ──────────────────────────────────────────
+
+@app.get("/market-test")
+async def market_test():
+    """Quick test: can we reach Anthropic API? Returns latency + status."""
+    import time
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        return {"ok": False, "error": "ANTHROPIC_API_KEY not set"}
+    t0 = time.time()
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": api_key,
+                         "anthropic-version": "2023-06-01",
+                         "content-type": "application/json"},
+                json={"model": "claude-haiku-4-5-20251001", "max_tokens": 10,
+                      "messages": [{"role": "user", "content": "Say OK"}]}
+            )
+        ms = int((time.time()-t0)*1000)
+        if resp.status_code == 200:
+            return {"ok": True, "ms": ms, "model": "claude-haiku-4-5-20251001"}
+        return {"ok": False, "status": resp.status_code, "error": resp.text[:100]}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:100]}
+
 _market_cache: dict = {"data": None, "ts": 0.0, "status": "idle"}
 
 async def _fetch_market_bg(api_key: str, stock_list: str):
     """Calls Claude Haiku in background; populates _market_cache."""
-    import httpx, json as _j, time
+    import json as _j, time
     from datetime import date
     _market_cache["status"] = "fetching"
     today = date.today().strftime("%d %B %Y")
@@ -621,8 +647,9 @@ async def _fetch_market_bg(api_key: str, stock_list: str):
 
 
 @app.get("/market-data")
-async def market_data(stocks: str = ""):
-    import asyncio, time
+async def market_data(stocks: str = "", background_tasks: "BackgroundTasks" = None):
+    from fastapi import BackgroundTasks as BT
+    import time
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not api_key:
         raise HTTPException(503, "ANTHROPIC_API_KEY not configured on server.")
@@ -631,17 +658,25 @@ async def market_data(stocks: str = ""):
 
     # Serve cache if fresh (< 30 min)
     if _market_cache["data"] and age < 1800:
+        log.info(f"market_data: serving cache (age {age:.0f}s)")
         return _market_cache["data"]
 
     # Trigger background fetch if not already running
+    stock_list = stocks or "HDFC Bank, Reliance, Infosys, ICICI Bank, Axis Bank"
     if _market_cache["status"] != "fetching":
-        stock_list = stocks or "HDFC Bank, Reliance, Infosys, ICICI Bank, Axis Bank"
-        asyncio.create_task(_fetch_market_bg(api_key, stock_list))
+        log.info(f"market_data: starting background fetch, status was {_market_cache['status']}")
+        if background_tasks:
+            background_tasks.add_task(_fetch_market_bg, api_key, stock_list)
+        else:
+            import asyncio
+            asyncio.create_task(_fetch_market_bg(api_key, stock_list))
 
     # Return stale data if available, else loading sentinel
     if _market_cache["data"]:
+        log.info("market_data: returning stale cache while refreshing")
         return _market_cache["data"]
 
+    log.info("market_data: no cache yet, returning loading sentinel")
     return {
         "status": "loading",
         "message": "Generating market data, please refresh in 20 seconds",
