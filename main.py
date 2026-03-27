@@ -622,7 +622,7 @@ Use your knowledge of recent Indian market data. Return ONLY valid JSON."""
         data = resp.json()
         text = data["content"][0]["text"].strip()
         if text.startswith("```"):
-            text = re.sub(r"^```json?\n?|```$", "", text, flags=re.M).strip()
+            text = re.sub(r"```[^\n]*\n?|```", "", text).strip()
 
         return _json.loads(text)
 
