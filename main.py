@@ -570,6 +570,49 @@ async def amfi_cap():
     raise HTTPException(503, "AMFI data temporarily unavailable")
 
 
+# ── Market Monitor endpoint ───────────────────────────────────────────────
+import anthropic as _anthropic
+
+@app.get("/market-data")
+async def market_data(stocks: str = ""):
+    """
+    Uses Claude to generate current Indian market data summary.
+    stocks: comma-separated list of portfolio stock names for news context
+    """
+    from datetime import date
+    today = date.today().strftime("%d %B %Y")
+    
+    prompt = f"""You are a market data assistant for an Indian mutual fund portfolio analyser. Today is {today}.
+
+Provide a structured JSON response with the following for Indian markets:
+
+1. indices: Array of {{name, value, change, changePct}} for: NIFTY 50, SENSEX, NIFTY MIDCAP 150, NIFTY SMALLCAP 250, NIFTY BANK, INDIA VIX. Use your best knowledge of recent values.
+2. fii_dii: {{date, fii_net_crore, dii_net_crore, fii_buy, fii_sell, dii_buy, dii_sell}} — recent FII/DII provisional data in crores
+3. earnings: Array of {{company, result_date, revenue_growth_pct, profit_growth_pct, beat_miss}} for 6 major companies with recent results
+4. market_news: Array of {{headline, category, sentiment}} — 6 key market-moving news items (macro, RBI, global, sector)
+5. portfolio_news: Array of {{stock, headline, sentiment}} — news for these stocks: {stocks or "HDFC Bank, Reliance Industries, Infosys, ICICI Bank, Axis Bank, Larsen & Toubro"}
+
+Return ONLY valid JSON, no markdown, no explanation. sentiment values: Positive, Negative, Neutral."""
+
+    try:
+        client = _anthropic.Anthropic()
+        msg = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=1500,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        text = msg.content[0].text
+        import json
+        # Strip markdown if present
+        text = text.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```json?\n?|```$", "", text, flags=re.M).strip()
+        data = json.loads(text)
+        return data
+    except Exception as e:
+        log.error(f"market_data error: {e}")
+        raise HTTPException(500, f"Market data unavailable: {str(e)[:100]}")
+
+
 if __name__ == "__main__":
     uvicorn.run("main:app",host="0.0.0.0",port=int(os.environ.get("PORT",8000)),reload=False)
-
