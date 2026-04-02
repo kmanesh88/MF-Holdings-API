@@ -111,6 +111,11 @@ def parse_sheet_universal(rows: list, fund_name: str = "") -> tuple:
                     nv = vals.get(i + 1, '')
                     if len(nv) > 5 and 'scheme' not in nv.lower():
                         fund_name = nv; break
+                # Motilal: R1 = ['Back to Index', 'Fund Name', ...]
+                if vlo in ('back to index', 'back to table of contents') and i + 1 in vals:
+                    nv = vals.get(i + 1, '')
+                    if len(nv) > 8 and any(k in nv.lower() for k in ['fund', 'etf', 'scheme']):
+                        fund_name = nv; break
                 if (i < 3 and len(v) > 8 and 'fund' in vlo
                         and 'mutual fund' not in vlo
                         and 'asset management' not in vlo
@@ -317,19 +322,32 @@ def parse_multi_sheet_with_index(wb, amc_name: str) -> dict:
     skip_sheets = {'index', 'cover', 'summary', 'disclaimer', 'annexure',
                    'contents', 'readme', 'back', 'annexure-a'}
 
-    # Build index map
+    # Build index map: sheet_code → full fund name
+    # Handles multiple layouts:
+    #   Standard: [code, name] — Sundaram/Nippon/Axis/ABSL/SBI
+    #   Motilal:  [serial, name, code] — code is last, name is middle
     index_map  = {}
     idx_sheet  = next((s for s in wb.sheetnames if s.strip().lower() == 'index'), None)
     if idx_sheet:
         for row in wb[idx_sheet].iter_rows(values_only=True):
             if not row: continue
             vals = [str(c or '').strip() for c in row]
+            # Try standard pattern: scan for [code, name] pair
+            found = False
             for i in range(len(vals) - 1):
                 code = vals[i]; name = vals[i + 1] if i + 1 < len(vals) else ''
                 if (re.match(r'^[A-Z0-9\-]{2,20}$', code)
                         and len(name) > 8
                         and any(k in name.lower() for k in ['fund', 'scheme', 'plan'])):
-                    index_map[code] = name; break
+                    index_map[code] = name; found = True; break
+            if not found:
+                # Try Motilal pattern: [serial, name, code] — name before code
+                for i in range(len(vals) - 1):
+                    name = vals[i]; code = vals[i + 1] if i + 1 < len(vals) else ''
+                    if (len(name) > 8
+                            and any(k in name.lower() for k in ['fund', 'scheme', 'plan'])
+                            and re.match(r'^[A-Z0-9\-]{2,20}$', code)):
+                        index_map[code] = name; break
 
     for sname in wb.sheetnames:
         if sname.strip().lower() in skip_sheets: continue
