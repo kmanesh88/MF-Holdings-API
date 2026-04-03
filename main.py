@@ -163,20 +163,25 @@ def parse_sheet_universal(rows: list, fund_name: str = "") -> tuple:
                         actual_name_col = ci; break
             break
 
-    # Detect decimal %
+    # Detect decimal % — sample up to 5 ISIN rows, use max value
+    # If max pct value < 1.0, it's decimal (0.6035 = 60.35%)
+    # If any value > 1.0, it's actual % (60.35 = 60.35%)
     pct_is_decimal = False
-    for row in rows[header_row_idx + 1: header_row_idx + 8]:
+    pct_samples = []
+    for row in rows[header_row_idx + 1: header_row_idx + 20]:
         if not row: continue
         vals = {i: str(c or '').strip() for i, c in enumerate(row)}
         if VALID_ISIN.match(vals.get(isin_col, '')):
-            raw = vals.get(pct_col, '').replace('%', '').replace(',', '').strip()
+            raw = vals.get(pct_col, '').replace('%', '').replace(',', '').replace('$', '').strip()
+            raw = re.sub(r'[^\d.\-]', '', raw)
             try:
                 pv = float(raw)
-                if 0 < pv < 0.6:
-                    pct_is_decimal = True
+                if pv > 0: pct_samples.append(pv)
             except:
                 pass
-            break
+        if len(pct_samples) >= 5: break
+    if pct_samples:
+        pct_is_decimal = max(pct_samples) < 1.0
 
     holdings  = []
     cash_pct  = 0.0
