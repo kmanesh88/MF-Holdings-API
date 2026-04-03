@@ -58,9 +58,15 @@ def load_db():
 
 def norm(s: str) -> str:
     n = str(s).lower().strip()
+    # Strip regulatory parenthetical suffix: "(Mid Cap Fund- An open ended...)"
+    n = re.sub(r'\s*\([^)]{20,}\).*$', '', n)  # remove long parentheticals
     n = re.sub(r'\s*-?\s*(direct|regular)\s*plan.*$', '', n, flags=re.I)
     n = re.sub(r'\s*-?\s*(growth|idcw|dividend)\s*$', '', n, flags=re.I)
     n = re.sub(r'\s*\(g\)\s*$|\s*\(d\)\s*$', '', n, flags=re.I)
+    # Expand common abbreviations
+    n = re.sub(r'\bpru\b', 'prudential', n)
+    n = re.sub(r'\bfof\b', 'fund of funds', n)
+    n = re.sub(r'\betf\b', 'etf', n)
     return re.sub(r'\s+', ' ', n).strip()
 
 VALID_ISIN = re.compile(r'^IN[A-Z0-9]{10}$')
