@@ -596,19 +596,20 @@ async def get_holdings(fund: str = Query(..., min_length=2)):
     qw = set(q.split()); best_s, best_v = 0.0, None
     for k, v in holdings_db.items():
         kw = set(k.split())
-        s  = len(qw & kw) / max(len(qw), len(kw), 1)
+        # Use min(len(qw),len(kw)) as denominator so long stored keys don't penalise short queries
+        s  = len(qw & kw) / max(min(len(qw), len(kw)), 1)
         if q in k: s += 0.6
         if k in q: s += 0.4
         if s > best_s: best_s, best_v = s, v
-    if best_v and best_s >= 0.25: return best_v
-    raise HTTPException(404, f"Not found: '{fund}'")
+    if best_v and best_s >= 0.4: return best_v
+    raise HTTPException(404, f"Not found: '{fund}' (best={best_s:.2f})")
 
 @app.get("/search")
 async def search(q: str = Query(..., min_length=2)):
     qn = norm(q); qw = set(qn.split()); res = []
     for k, v in holdings_db.items():
         kw = set(k.split())
-        s  = len(qw & kw) / max(len(qw), len(kw), 1)
+        s  = len(qw & kw) / max(min(len(qw), len(kw)), 1)
         if qn in k: s += 0.6
         if k in qn: s += 0.4
         if s > 0:
