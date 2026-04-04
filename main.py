@@ -592,17 +592,67 @@ async def list_funds(amc: Optional[str] = None):
 async def get_holdings(fund: str = Query(..., min_length=2)):
     if not holdings_db: raise HTTPException(503, "No data yet")
     q = norm(fund)
-    if q in holdings_db: return holdings_db[q]
+    if q in holdings_db:
+        return _enrich_holdings(holdings_db[q])
     qw = set(q.split()); best_s, best_v = 0.0, None
     for k, v in holdings_db.items():
         kw = set(k.split())
-        # Use min(len(qw),len(kw)) as denominator so long stored keys don't penalise short queries
         s  = len(qw & kw) / max(min(len(qw), len(kw)), 1)
         if q in k: s += 0.6
         if k in q: s += 0.4
         if s > best_s: best_s, best_v = s, v
-    if best_v and best_s >= 0.4: return best_v
+    if best_v and best_s >= 0.4: return _enrich_holdings(best_v)
     raise HTTPException(404, f"Not found: '{fund}' (best={best_s:.2f})")
+
+def _amfi_cap_map() -> dict:
+    """Build name->cap dict from cached AMFI data."""
+    d = _amfi_cap_cache.get("data", {})
+    m = {}
+    for cap in ("large", "mid", "small"):
+        for name in d.get(cap, []):
+            m[name] = cap
+    return m
+
+def _norm_stock(name: str) -> str:
+    n = str(name).upper().strip()
+    n = re.sub(r'\bLTD\.?\b|\bLIMITED\b|\bPVT\.?\b|\bPRIVATE\b', '', n)
+    n = re.sub(r'[&]', 'AND', n)
+    n = re.sub(r"['\"]", '', n)
+    n = re.sub(r'[.\-,()\[\]]', ' ', n)
+    return re.sub(r'\s+', ' ', n).strip()
+
+DEBT_SECTOR_RE = re.compile(
+    r'crisil|care|icra|fitch|ind-ra|aaa|aa\+|aa-|\baa\b|sovereign|'
+    r'tbill|t-bill|treps|cblo|repo|gilt|g-sec|sdl|commercial paper|'
+    r'certificate of deposit|fixed deposit|bond|debenture|ncd', re.I)
+
+def _enrich_holdings(fund_data: dict) -> dict:
+    """Add cap/type fields to each holding using server's AMFI data."""
+    import copy
+    cap_map = _amfi_cap_map()
+    result = copy.copy(fund_data)
+    enriched = []
+    for h in fund_data.get("holdings", []):
+        eh = dict(h)
+        sector = h.get("sector", "")
+        name   = h.get("name", "")
+        # Classify instrument type
+        is_debt = bool(DEBT_SECTOR_RE.search(sector)) or bool(re.match(r'^\d+\.?\d*%', name))
+        eh["type"] = "debt" if is_debt else "equity"
+        # For equity: classify cap using AMFI list
+        if not is_debt and cap_map:
+            key = _norm_stock(name)
+            cap = cap_map.get(key)
+            if not cap and len(key) > 8:
+                pre = key[:12]
+                cap = next((cap_map[k] for k in cap_map if len(k)>8 and k[:12]==pre), None)
+            eh["cap"] = cap or "small"
+        else:
+            eh["cap"] = None
+        enriched.append(eh)
+    result = dict(fund_data)
+    result["holdings"] = enriched
+    return result
 
 @app.get("/search")
 async def search(q: str = Query(..., min_length=2)):
