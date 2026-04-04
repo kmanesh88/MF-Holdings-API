@@ -1,5 +1,5 @@
 """
-MF Holdings API v6 — Universal AMC Parser
+MF Holdings API v7 — Universal AMC Parser + ISIN-based cap classification
 Formats confirmed:
   A: Sundaram/Nippon/Axis/ABSL — Index + fund sheets, % decimal
   B: SBI — Index + fund sheets, % actual
@@ -34,7 +34,7 @@ async def lifespan(app):
     load_db()
     yield
 
-app = FastAPI(title="MF Holdings API", version="6.0.0", lifespan=lifespan)
+app = FastAPI(title="MF Holdings API", version="7.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
                    allow_methods=["GET","POST","DELETE"], allow_headers=["*"])
 
@@ -43,6 +43,42 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_FILE  = DATA_DIR / "holdings.json"
 holdings_db: dict = {}
 _amfi_cap_cache: dict = {}
+
+# ---------------------------------------------------------------------------
+# AMFI CAP MAP — loaded once from bundled Excel at startup
+# Keys: ISIN strings. Values: 'large' | 'mid'  (absent = 'small')
+# File: amfi_market_cap.xlsx in the same directory as main.py
+# Update every Jan / Jul: replace the file and redeploy.
+# ---------------------------------------------------------------------------
+def _load_amfi_cap_map_from_file(path: str = "amfi_market_cap.xlsx") -> dict:
+    if not os.path.exists(path):
+        log.warning(f"AMFI cap file not found at '{path}'. Will fall back to live fetch.")
+        return {}
+    try:
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        ws = wb.active
+        cap_map = {}
+        for row in ws.iter_rows(min_row=3, values_only=True):
+            isin     = row[2]   # col C
+            category = row[10]  # col K
+            if not isin or not category:
+                continue
+            cat = str(category).strip().lower()
+            if "large" in cat:
+                cap_map[isin.strip()] = "large"
+            elif "mid" in cat:
+                cap_map[isin.strip()] = "mid"
+            # small cap entries skipped — default is 'small'
+        wb.close()
+        large_n = sum(1 for v in cap_map.values() if v == "large")
+        mid_n   = sum(1 for v in cap_map.values() if v == "mid")
+        log.info(f"AMFI cap map loaded from file: {large_n} large, {mid_n} mid ({len(cap_map)} total)")
+        return cap_map
+    except Exception as e:
+        log.warning(f"AMFI cap file load failed: {e}. Will fall back to live fetch.")
+        return {}
+
+AMFI_ISIN_CAP: dict = _load_amfi_cap_map_from_file()
 
 def save_db():
     try: DB_FILE.write_text(json.dumps(holdings_db, ensure_ascii=False))
@@ -569,7 +605,7 @@ def check_secret(secret: str):
 @app.get("/")
 async def root():
     amcs = sorted({v["amc"] for v in holdings_db.values()})
-    return {"service": "MF Holdings API v6", "funds": len(holdings_db), "amcs": amcs,
+    return {"service": "MF Holdings API v7", "funds": len(holdings_db), "amcs": amcs,
             "last_updated": max(
                 (v.get("uploaded_at", "") for v in holdings_db.values()), default=None)}
 
@@ -639,13 +675,21 @@ def _enrich_holdings(fund_data: dict) -> dict:
         # Classify instrument type
         is_debt = bool(DEBT_SECTOR_RE.search(sector)) or bool(re.match(r'^\d+\.?\d*%', name))
         eh["type"] = "debt" if is_debt else "equity"
-        # For equity: classify cap using AMFI list
-        if not is_debt and cap_map:
-            key = _norm_stock(name)
-            cap = cap_map.get(key)
-            if not cap and len(key) > 8:
-                pre = key[:12]
-                cap = next((cap_map[k] for k in cap_map if len(k)>8 and k[:12]==pre), None)
+        # For equity: classify cap
+        # Priority 1: ISIN lookup against bundled AMFI Excel (fast, accurate)
+        # Priority 2: name-based lookup against live-fetched cache (fallback if file missing)
+        # Priority 3: default 'small' — correct per SEBI (everything outside top 250 is small cap)
+        if not is_debt:
+            isin_val = h.get("isin", "").strip()
+            cap = None
+            if isin_val and AMFI_ISIN_CAP:
+                cap = AMFI_ISIN_CAP.get(isin_val)
+            if cap is None and cap_map:
+                key = _norm_stock(name)
+                cap = cap_map.get(key)
+                if not cap and len(key) > 8:
+                    pre = key[:12]
+                    cap = next((cap_map[k] for k in cap_map if len(k)>8 and k[:12]==pre), None)
             eh["cap"] = cap or "small"
         else:
             eh["cap"] = None
