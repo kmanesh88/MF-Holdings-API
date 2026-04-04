@@ -606,6 +606,7 @@ def check_secret(secret: str):
 async def root():
     amcs = sorted({v["amc"] for v in holdings_db.values()})
     return {"service": "MF Holdings API v7", "funds": len(holdings_db), "amcs": amcs,
+            "amfi_cap_loaded": len(AMFI_ISIN_CAP),
             "last_updated": max(
                 (v.get("uploaded_at", "") for v in holdings_db.values()), default=None)}
 
