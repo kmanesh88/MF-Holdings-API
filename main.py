@@ -694,7 +694,9 @@ def _enrich_holdings(fund_data: dict) -> dict:
         sector = h.get("sector", "")
         name   = h.get("name", "")
         # Classify instrument type
-        is_debt = (bool(DEBT_SECTOR_RE.search(sector)) and not bool(EQUITY_SECTOR_RE.match(sector))) \
+        # If sector == name, the parser found no sector — don't use it for debt detection
+        effective_sector = "" if sector.strip() == name.strip() else sector
+        is_debt = (bool(DEBT_SECTOR_RE.search(effective_sector)) and not bool(EQUITY_SECTOR_RE.match(effective_sector))) \
                   or bool(re.match(r'^\d+\.?\d*%', name))
         eh["type"] = "debt" if is_debt else "equity"
         # For equity: classify cap
