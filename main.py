@@ -676,6 +676,13 @@ DEBT_SECTOR_RE = re.compile(
     r'tbill|t-bill|treps|cblo|repo|gilt|g-sec|sdl|commercial paper|'
     r'certificate of deposit|fixed deposit|bond|debenture|ncd', re.I)
 
+# Equity sector patterns — if sector matches these, it's definitely equity
+# even if DEBT_SECTOR_RE also matches (e.g. CRISIL Ltd in "Financial Services")
+EQUITY_SECTOR_RE = re.compile(
+    r'^(banks|insurance|it |software|pharma|auto|fmcg|consumer|capital goods|'
+    r'industrial|financial services|healthcare|telecom|cement|metals|energy|'
+    r'power|realty|media|retail|chemicals|textiles|agri|diversified)', re.I)
+
 def _enrich_holdings(fund_data: dict) -> dict:
     """Add cap/type fields to each holding using server's AMFI data."""
     import copy
@@ -687,7 +694,8 @@ def _enrich_holdings(fund_data: dict) -> dict:
         sector = h.get("sector", "")
         name   = h.get("name", "")
         # Classify instrument type
-        is_debt = bool(DEBT_SECTOR_RE.search(sector)) or bool(re.match(r'^\d+\.?\d*%', name))
+        is_debt = (bool(DEBT_SECTOR_RE.search(sector)) and not bool(EQUITY_SECTOR_RE.match(sector))) \
+                  or bool(re.match(r'^\d+\.?\d*%', name))
         eh["type"] = "debt" if is_debt else "equity"
         # For equity: classify cap
         # Priority 1: ISIN lookup against bundled AMFI Excel (fast, accurate)
