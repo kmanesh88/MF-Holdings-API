@@ -80,6 +80,19 @@ def _load_amfi_cap_map_from_file(path: str = "amfi_market_cap.xlsx") -> dict:
 
 AMFI_ISIN_CAP: dict = _load_amfi_cap_map_from_file()
 
+# ---------------------------------------------------------------------------
+# ISIN OVERRIDE MAP — stocks where AMFI Excel has old ISIN but AMC disclosures
+# use a new ISIN (issued after bonus shares / stock splits / reclassification).
+# Add new entries here as discovered. Format: { new_isin: 'large'|'mid'|'small' }
+# ---------------------------------------------------------------------------
+ISIN_OVERRIDES: dict = {
+    "INE1TAE01010": "large",   # Tata Motors (new ISIN, old: INE155A01022)
+    "INE237A01036": "large",   # Kotak Mahindra Bank (new ISIN, old: INE237A01028)
+    "INE745G01043": "mid",     # Multi Commodity Exchange (new ISIN, old: INE745G01035)
+}
+AMFI_ISIN_CAP.update(ISIN_OVERRIDES)
+log.info(f"ISIN overrides applied: {len(ISIN_OVERRIDES)} entries")
+
 def save_db():
     try: DB_FILE.write_text(json.dumps(holdings_db, ensure_ascii=False))
     except Exception as e: log.warning(f"Save failed: {e}")
