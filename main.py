@@ -942,29 +942,76 @@ async def _fetch_indices() -> list:
     return results
 
 async def _fetch_fii_dii() -> dict:
-    """Fetch FII/DII activity from NSE."""
+    """Fetch FII/DII activity from NSE with multiple endpoint attempts."""
+    # NSE has several endpoints for FII/DII — try each with correct field names
+    ENDPOINTS = [
+        "https://www.nseindia.com/api/fiidiiTradeReact",
+        "https://www.nseindia.com/api/fii-dii-data",
+    ]
+    # Known NSE field name variants
+    FII_NET_KEYS  = ["fi_netVal", "fiiNetPurchSales", "netVal", "NET_PURCHASE_SALES", "fii_net"]
+    DII_NET_KEYS  = ["di_netVal", "diiNetPurchSales", "diiNet", "NET_PURCHASE_SALES", "dii_net"]
+    FII_BUY_KEYS  = ["fi_buyVal", "fiiBuyValue", "buyVal", "GROSS_PURCHASE", "fii_buy"]
+    FII_SELL_KEYS = ["fi_sellVal", "fiiSellValue", "sellVal", "GROSS_SALES", "fii_sell"]
+    DII_BUY_KEYS  = ["di_buyVal", "diiBuyValue", "diiBuy", "GROSS_PURCHASE", "dii_buy"]
+    DII_SELL_KEYS = ["di_sellVal", "diiSellValue", "diiSell", "GROSS_SALES", "dii_sell"]
+    DATE_KEYS     = ["date", "tradeDate", "TRADE_DATE", "Date"]
+
+    def _pick(row, keys, default=0):
+        for k in keys:
+            if k in row and row[k] is not None:
+                try: return float(str(row[k]).replace(',',''))
+                except: pass
+        return default
+
+    def _pick_str(row, keys, default=''):
+        for k in keys:
+            if k in row and row[k]: return str(row[k])
+        return default
+
     try:
         async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
             await _get_nse_session(client)
-            r = await client.get(
-                "https://www.nseindia.com/api/fiidiiTradeReact",
-                headers=NSE_HEADERS, timeout=8.0)
-            if r.status_code == 200:
-                data = r.json()
-                # NSE returns array of FII/DII rows, latest first
-                if isinstance(data, list) and data:
-                    row = data[0]
-                    return {
-                        "date":          row.get("date", ""),
-                        "fii_net_crore":  float(row.get("fi_netVal", 0) or 0),
-                        "dii_net_crore":  float(row.get("di_netVal", 0) or 0),
-                        "fii_buy":        float(row.get("fi_buyVal", 0) or 0),
-                        "fii_sell":       float(row.get("fi_sellVal", 0) or 0),
-                        "dii_buy":        float(row.get("di_buyVal", 0) or 0),
-                        "dii_sell":       float(row.get("di_sellVal", 0) or 0),
+            for endpoint in ENDPOINTS:
+                try:
+                    r = await client.get(endpoint, headers=NSE_HEADERS, timeout=8.0)
+                    if r.status_code != 200:
+                        log.warning(f"FII/DII {endpoint}: HTTP {r.status_code}")
+                        continue
+                    data = r.json()
+                    # Log raw keys for debugging
+                    if isinstance(data, list) and data:
+                        log.info(f"FII/DII keys: {list(data[0].keys())[:10]}")
+                        row = data[0]
+                    elif isinstance(data, dict):
+                        log.info(f"FII/DII dict keys: {list(data.keys())[:10]}")
+                        # May be wrapped: {"data": [...]}
+                        inner = data.get("data") or data.get("results") or []
+                        if inner and isinstance(inner, list):
+                            row = inner[0]
+                        else:
+                            row = data
+                    else:
+                        continue
+
+                    result = {
+                        "date":         _pick_str(row, DATE_KEYS, 'Latest'),
+                        "fii_net_crore": _pick(row, FII_NET_KEYS),
+                        "dii_net_crore": _pick(row, DII_NET_KEYS),
+                        "fii_buy":       _pick(row, FII_BUY_KEYS),
+                        "fii_sell":      _pick(row, FII_SELL_KEYS),
+                        "dii_buy":       _pick(row, DII_BUY_KEYS),
+                        "dii_sell":      _pick(row, DII_SELL_KEYS),
                     }
+                    # Validate — if all zeros something is wrong
+                    if result["fii_net_crore"] != 0 or result["dii_net_crore"] != 0:
+                        log.info(f"FII/DII loaded from {endpoint}: FII={result['fii_net_crore']}, DII={result['dii_net_crore']}")
+                        return result
+                    log.warning(f"FII/DII {endpoint}: all zeros — field names may differ. Raw: {dict(list(row.items())[:5])}")
+                except Exception as e:
+                    log.warning(f"FII/DII endpoint {endpoint} failed: {e}")
     except Exception as e:
-        log.warning(f"FII/DII fetch failed: {e}")
+        log.warning(f"FII/DII session failed: {e}")
     return {}
 
 async def _fetch_news_and_earnings(api_key: str, stock_list: str) -> dict:
@@ -1014,6 +1061,26 @@ async def _fetch_news_and_earnings(api_key: str, stock_list: str) -> dict:
     except Exception as e:
         log.warning(f"News fetch failed: {e}")
     return {"earnings": [], "market_news": [], "portfolio_news": []}
+
+@app.get("/debug-fii")
+async def debug_fii():
+    """Debug endpoint — shows raw NSE FII/DII response for field inspection."""
+    results = {}
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+        await _get_nse_session(client)
+        for url in [
+            "https://www.nseindia.com/api/fiidiiTradeReact",
+            "https://www.nseindia.com/api/fii-dii-data",
+        ]:
+            try:
+                r = await client.get(url, headers=NSE_HEADERS, timeout=8.0)
+                results[url] = {
+                    "status": r.status_code,
+                    "raw": r.text[:500] if r.status_code == 200 else r.text[:200]
+                }
+            except Exception as e:
+                results[url] = {"error": str(e)}
+    return results
 
 @app.get("/market-test")
 async def market_test():
