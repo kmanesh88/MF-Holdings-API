@@ -876,6 +876,145 @@ async def amfi_cap():
 # =============================================================================
 # MARKET MONITOR
 # =============================================================================
+
+_market_cache: dict = {"data": None, "ts": 0.0, "status": "idle"}
+_indices_cache: dict = {"data": None, "ts": 0.0}
+_news_cache: dict = {"data": None, "ts": 0.0}
+
+NSE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.nseindia.com/",
+    "Origin": "https://www.nseindia.com",
+}
+
+async def _get_nse_session(client: httpx.AsyncClient):
+    """Hit NSE homepage to get session cookies before API calls."""
+    try:
+        await client.get("https://www.nseindia.com", headers=NSE_HEADERS, timeout=10.0)
+    except Exception:
+        pass
+
+async def _fetch_indices() -> list:
+    """Fetch live index data from NSE."""
+    import time
+    if _indices_cache["data"] and (time.time() - _indices_cache["ts"]) < 900:  # 15 min cache
+        return _indices_cache["data"]
+    results = []
+    index_map = [
+        ("NIFTY 50",        "NIFTY%2050"),
+        ("NIFTY MIDCAP 150", "NIFTY%20MIDCAP%20150"),
+        ("NIFTY SMALLCAP 250", "NIFTY%20SMALLCAP%20250"),
+        ("NIFTY BANK",      "NIFTY%20BANK"),
+        ("INDIA VIX",       "INDIA%20VIX"),
+        ("NIFTY IT",        "NIFTY%20IT"),
+    ]
+    try:
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+            await _get_nse_session(client)
+            for label, enc in index_map:
+                try:
+                    r = await client.get(
+                        f"https://www.nseindia.com/api/equity-stockIndices?index={enc}",
+                        headers=NSE_HEADERS, timeout=8.0)
+                    if r.status_code == 200:
+                        d = r.json()
+                        meta = d.get("metadata", {})
+                        results.append({
+                            "name":      label,
+                            "value":     meta.get("last", 0),
+                            "change":    meta.get("change", 0),
+                            "changePct": meta.get("percentChange", 0),
+                            "open":      meta.get("open", 0),
+                            "high":      meta.get("high", 0),
+                            "low":       meta.get("low", 0),
+                            "yearHigh":  meta.get("yearHigh", 0),
+                            "yearLow":   meta.get("yearLow", 0),
+                        })
+                except Exception as e:
+                    log.warning(f"Index fetch failed for {label}: {e}")
+    except Exception as e:
+        log.warning(f"NSE session failed: {e}")
+    if results:
+        _indices_cache["data"] = results
+        _indices_cache["ts"]   = time.time()
+    return results
+
+async def _fetch_fii_dii() -> dict:
+    """Fetch FII/DII activity from NSE."""
+    try:
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+            await _get_nse_session(client)
+            r = await client.get(
+                "https://www.nseindia.com/api/fiidiiTradeReact",
+                headers=NSE_HEADERS, timeout=8.0)
+            if r.status_code == 200:
+                data = r.json()
+                # NSE returns array of FII/DII rows, latest first
+                if isinstance(data, list) and data:
+                    row = data[0]
+                    return {
+                        "date":          row.get("date", ""),
+                        "fii_net_crore":  float(row.get("fi_netVal", 0) or 0),
+                        "dii_net_crore":  float(row.get("di_netVal", 0) or 0),
+                        "fii_buy":        float(row.get("fi_buyVal", 0) or 0),
+                        "fii_sell":       float(row.get("fi_sellVal", 0) or 0),
+                        "dii_buy":        float(row.get("di_buyVal", 0) or 0),
+                        "dii_sell":       float(row.get("di_sellVal", 0) or 0),
+                    }
+    except Exception as e:
+        log.warning(f"FII/DII fetch failed: {e}")
+    return {}
+
+async def _fetch_news_and_earnings(api_key: str, stock_list: str) -> dict:
+    """Use Claude with web_search to fetch real market news and earnings."""
+    import time, json as _j
+    if _news_cache["data"] and (time.time() - _news_cache["ts"]) < 21600:  # 6 hour cache
+        return _news_cache["data"]
+    from datetime import date
+    today = date.today().strftime("%d %B %Y")
+    prompt = (
+        f"Today is {today}. Search the web for:\n"
+        f"1. Indian stock market news today (Nifty, Sensex, FII activity)\n"
+        f"2. Recent earnings results this week from Indian companies\n"
+        f"3. Any major news for these specific stocks: {stock_list}\n\n"
+        "Return ONLY valid JSON (no markdown) in this exact format:\n"
+        '{"earnings":[{"company":"","result_date":"","revenue_growth_pct":0,"profit_growth_pct":0,"beat_miss":"Beat"}],'
+        '"market_news":[{"headline":"","category":"Market|Macro|Sector|Policy","sentiment":"Positive|Neutral|Negative"}],'
+        '"portfolio_news":[{"stock":"","headline":"","sentiment":"Positive|Neutral|Negative"}]}'
+        "\nInclude 3-5 earnings, 4-6 market news items, 3-5 portfolio stock news. Use real data from web search."
+    )
+    try:
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
+                         "content-type": "application/json"},
+                json={
+                    "model": "claude-haiku-4-5-20251001",
+                    "max_tokens": 1500,
+                    "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+                    "messages": [{"role": "user", "content": prompt}]
+                })
+        if resp.status_code == 200:
+            content_blocks = resp.json().get("content", [])
+            # Extract text from response (may include tool_use blocks)
+            text = " ".join(b.get("text", "") for b in content_blocks if b.get("type") == "text").strip()
+            text = re.sub(r"```[^\n]*\n?|```", "", text).strip()
+            # Find JSON in response
+            start = text.find("{")
+            end   = text.rfind("}") + 1
+            if start >= 0 and end > start:
+                result = _j.loads(text[start:end])
+                _news_cache["data"] = result
+                _news_cache["ts"]   = time.time()
+                return result
+        log.warning(f"News fetch HTTP {resp.status_code}: {resp.text[:200]}")
+    except Exception as e:
+        log.warning(f"News fetch failed: {e}")
+    return {"earnings": [], "market_news": [], "portfolio_news": []}
+
 @app.get("/market-test")
 async def market_test():
     import time
@@ -897,63 +1036,55 @@ async def market_test():
     except Exception as e:
         return {"ok": False, "error": str(e)[:100]}
 
-_market_cache: dict = {"data": None, "ts": 0.0, "status": "idle"}
-
-async def _fetch_market_bg(api_key: str, stock_list: str):
-    import json as _j, time
-    from datetime import date
-    _market_cache["status"] = "fetching"
-    today  = date.today().strftime("%d %B %Y")
-    prompt = (
-        f"Today is {today}. Return ONLY valid JSON (no markdown) with:\n"
-        '{"indices":[{"name":"NIFTY 50","value":0,"change":0,"changePct":0},'
-        '{"name":"SENSEX","value":0,"change":0,"changePct":0},'
-        '{"name":"NIFTY MIDCAP 150","value":0,"change":0,"changePct":0},'
-        '{"name":"NIFTY SMALLCAP 250","value":0,"change":0,"changePct":0},'
-        '{"name":"NIFTY BANK","value":0,"change":0,"changePct":0},'
-        '{"name":"INDIA VIX","value":0,"change":0,"changePct":0}],'
-        '"fii_dii":{"date":"","fii_net_crore":0,"dii_net_crore":0,"fii_buy":0,'
-        '"fii_sell":0,"dii_buy":0,"dii_sell":0},'
-        '"earnings":[{"company":"","result_date":"","revenue_growth_pct":0,'
-        '"profit_growth_pct":0,"beat_miss":"Beat"}],'
-        '"market_news":[{"headline":"","category":"","sentiment":"Positive"}],'
-        f'"portfolio_news":[{{"stock":"","headline":"","sentiment":"Positive"}}]}}'
-        f"\nFill with real recent data. Stocks: {stock_list}"
-    )
-    try:
-        async with httpx.AsyncClient(timeout=28.0) as client:
-            resp = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
-                         "content-type": "application/json"},
-                json={"model": "claude-haiku-4-5-20251001", "max_tokens": 1200,
-                      "messages": [{"role": "user", "content": prompt}]})
-        if resp.status_code == 200:
-            text = resp.json()["content"][0]["text"].strip()
-            text = re.sub(r"```[^\n]*\n?|```", "", text).strip()
-            _market_cache["data"]   = _j.loads(text)
-            _market_cache["ts"]     = time.time()
-            _market_cache["status"] = "ready"
-        else:
-            _market_cache["status"] = "error"
-    except Exception as e:
-        log.error(f"_fetch_market_bg: {e}"); _market_cache["status"] = "error"
-
 @app.get("/market-data")
 async def market_data(stocks: str = ""):
     import asyncio, time
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key: raise HTTPException(503, "ANTHROPIC_API_KEY not configured")
-    age = time.time() - _market_cache["ts"]
-    if _market_cache["data"] and age < 1800: return _market_cache["data"]
-    stock_list = stocks or "HDFC Bank, Reliance, Infosys, ICICI Bank, Axis Bank"
-    if _market_cache["status"] != "fetching":
-        asyncio.create_task(_fetch_market_bg(api_key, stock_list))
-    if _market_cache["data"]: return _market_cache["data"]
-    return {"status": "loading",
-            "message": "Generating market data, please refresh in 20 seconds",
-            "indices": [], "fii_dii": {}, "earnings": [],
-            "market_news": [], "portfolio_news": []}
+    stock_list = stocks or "HDFC Bank, Reliance, Infosys, ICICI Bank, Axis Bank, TCS, Kotak Mahindra Bank"
+
+    # Fetch indices and FII/DII in parallel (fast, direct from NSE)
+    indices, fii_dii = await asyncio.gather(
+        _fetch_indices(),
+        _fetch_fii_dii(),
+        return_exceptions=True
+    )
+    if isinstance(indices, Exception):
+        log.warning(f"Indices fetch error: {indices}")
+        indices = []
+    if isinstance(fii_dii, Exception):
+        log.warning(f"FII/DII fetch error: {fii_dii}")
+        fii_dii = {}
+
+    # Fetch news async — use cached if fresh, else fetch in background
+    news = {}
+    if api_key:
+        age = time.time() - _news_cache["ts"]
+        if _news_cache["data"] and age < 21600:
+            news = _news_cache["data"]
+        elif _market_cache["status"] != "fetching":
+            _market_cache["status"] = "fetching"
+            asyncio.create_task(_fetch_news_bg(api_key, stock_list))
+            news = _news_cache.get("data") or {}
+    else:
+        news = {}
+
+    return {
+        "indices":        indices,
+        "fii_dii":        fii_dii,
+        "earnings":       news.get("earnings", []),
+        "market_news":    news.get("market_news", []),
+        "portfolio_news": news.get("portfolio_news", []),
+        "news_status":    "ready" if news else "loading",
+    }
+
+async def _fetch_news_bg(api_key: str, stock_list: str):
+    """Background task to fetch news without blocking the response."""
+    try:
+        await _fetch_news_and_earnings(api_key, stock_list)
+    except Exception as e:
+        log.warning(f"Background news fetch failed: {e}")
+    finally:
+        _market_cache["status"] = "idle"
 
 
 if __name__ == "__main__":
