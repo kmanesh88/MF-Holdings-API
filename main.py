@@ -925,7 +925,7 @@ async def _fetch_indices() -> list:
                             "name":      label,
                             "value":     meta.get("last", 0),
                             "change":    meta.get("change", 0),
-                            "changePct": meta.get("percentChange", 0),
+                            "changePct": meta.get("percentChange") or (round(meta.get("change",0)/meta.get("last",1)*100,2) if meta.get("last") else 0),
                             "open":      meta.get("open", 0),
                             "high":      meta.get("high", 0),
                             "low":       meta.get("low", 0),
@@ -1018,11 +1018,12 @@ async def _fetch_news_and_earnings(api_key: str, stock_list: str) -> dict:
         "Include 3-5 earnings, 4-6 market news, 3-5 portfolio news. Real data only."
     )
     try:
-        async with httpx.AsyncClient(timeout=45.0) as client:
+        async with httpx.AsyncClient(timeout=120.0) as client:
             resp = await client.post(
                 "https://api.anthropic.com/v1/messages",
                 headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
-                         "content-type": "application/json"},
+                         "content-type": "application/json",
+                         "anthropic-beta": "web-search-2025-03-05"},
                 json={
                     "model": "claude-haiku-4-5-20251001",
                     "max_tokens": 2500,
@@ -1046,6 +1047,18 @@ async def _fetch_news_and_earnings(api_key: str, stock_list: str) -> dict:
     except Exception as e:
         log.warning(f"News fetch failed: {e}")
     return {"earnings": [], "market_news": [], "portfolio_news": []}
+
+@app.get("/debug-news")
+async def debug_news():
+    """Force a fresh news fetch and return result directly for debugging."""
+    global _news_cache
+    _news_cache = {"data": None, "ts": 0.0}  # clear cache
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        return {"error": "ANTHROPIC_API_KEY not set"}
+    result = await _fetch_news_and_earnings(api_key, "HDFC Bank, Reliance, TCS, Infosys")
+    return {"status": "ok", "keys": list(result.keys()), "earnings_count": len(result.get("earnings",[])),
+            "news_count": len(result.get("market_news",[])), "fixed_income": result.get("fixed_income",{})}
 
 @app.get("/debug-fii")
 async def debug_fii():
