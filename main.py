@@ -1019,34 +1019,79 @@ async def _fetch_news_and_earnings(api_key: str, stock_list: str) -> dict:
     )
     try:
         async with httpx.AsyncClient(timeout=120.0) as client:
-            resp = await client.post(
+            # Step 1: Call with web_search tool — Claude will search and return tool results
+            resp1 = await client.post(
                 "https://api.anthropic.com/v1/messages",
                 headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
-                         "content-type": "application/json",
-                         "anthropic-beta": "web-search-2025-03-05"},
+                         "content-type": "application/json"},
                 json={
                     "model": "claude-haiku-4-5-20251001",
-                    "max_tokens": 2500,
-                    "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+                    "max_tokens": 4000,
+                    "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 8,
+                               "user_location": {"type": "approximate", "city": "Chennai",
+                                                 "region": "Tamil Nadu", "country": "IN",
+                                                 "timezone": "Asia/Kolkata"}}],
                     "messages": [{"role": "user", "content": prompt}]
                 })
-        if resp.status_code == 200:
-            content_blocks = resp.json().get("content", [])
-            # Extract text from response (may include tool_use blocks)
-            text = " ".join(b.get("text", "") for b in content_blocks if b.get("type") == "text").strip()
+            if resp1.status_code != 200:
+                log.warning(f"News fetch step1 HTTP {resp1.status_code}: {resp1.text[:200]}")
+                return {"earnings": [], "market_news": [], "portfolio_news": [], "fixed_income": {}}
+
+            resp1_data = resp1.json()
+            assistant_content = resp1_data.get("content", [])
+
+            # If stop_reason is tool_use, we need to send tool results back
+            if resp1_data.get("stop_reason") == "tool_use":
+                # Build tool results from web_search_tool_result blocks
+                tool_results = []
+                for block in assistant_content:
+                    if block.get("type") == "web_search_tool_result":
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.get("tool_use_id"),
+                            "content": block.get("content", [])
+                        })
+
+                # Step 2: Send tool results back to get final text response
+                resp2 = await client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
+                             "content-type": "application/json"},
+                    json={
+                        "model": "claude-haiku-4-5-20251001",
+                        "max_tokens": 2500,
+                        "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 8}],
+                        "messages": [
+                            {"role": "user", "content": prompt},
+                            {"role": "assistant", "content": assistant_content},
+                            {"role": "user", "content": tool_results if tool_results else
+                             [{"type": "text", "text": "Based on the search results above, provide the JSON."}]}
+                        ]
+                    })
+                if resp2.status_code == 200:
+                    final_blocks = resp2.json().get("content", [])
+                else:
+                    final_blocks = assistant_content
+            else:
+                final_blocks = assistant_content
+
+            # Extract text from final response
+            text = " ".join(b.get("text", "") for b in final_blocks if b.get("type") == "text").strip()
             text = re.sub(r"```[^\n]*\n?|```", "", text).strip()
-            # Find JSON in response
             start = text.find("{")
             end   = text.rfind("}") + 1
             if start >= 0 and end > start:
                 result = _j.loads(text[start:end])
                 _news_cache["data"] = result
                 _news_cache["ts"]   = time.time()
+                log.info(f"News fetch OK: {len(result.get('market_news',[]))} news, "
+                         f"{len(result.get('earnings',[]))} earnings, "
+                         f"fixed_income keys: {list(result.get('fixed_income',{}).keys())}")
                 return result
-        log.warning(f"News fetch HTTP {resp.status_code}: {resp.text[:200]}")
+            log.warning(f"News fetch: no JSON found in response. Text: {text[:300]}")
     except Exception as e:
         log.warning(f"News fetch failed: {e}")
-    return {"earnings": [], "market_news": [], "portfolio_news": []}
+    return {"earnings": [], "market_news": [], "portfolio_news": [], "fixed_income": {}}
 
 @app.get("/debug-news")
 async def debug_news():
