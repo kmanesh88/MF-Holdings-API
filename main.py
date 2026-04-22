@@ -1106,7 +1106,7 @@ async def debug_news():
         from datetime import date
         import json as _j
         today = date.today().strftime("%d %B %Y")
-        prompt = f"Today is {today}. What is the current RBI repo rate and India 10-year G-Sec yield? Search the web and return ONLY JSON: {{"repo_rate": 0.0, "gsec_10y": 0.0}}"
+        prompt = f'Today is {today}. What is the current RBI repo rate and India 10-year G-Sec yield? Search the web and return ONLY JSON: {{"repo_rate": 0.0, "gsec_10y": 0.0}}'
         async with httpx.AsyncClient(timeout=120.0) as client:
             resp1 = await client.post(
                 "https://api.anthropic.com/v1/messages",
