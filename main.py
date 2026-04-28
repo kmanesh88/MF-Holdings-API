@@ -993,29 +993,12 @@ async def _fetch_news_and_earnings(api_key: str, stock_list: str) -> dict:
     from datetime import date
     today = date.today().strftime("%d %B %Y")
     prompt = (
-        f"Today is {today}. Search the web and return ONLY valid JSON (no markdown).\n\n"
-        "Format:\n"
-        '{"earnings":[{"company":"","result_date":"","revenue_growth_pct":0,"profit_growth_pct":0,"beat_miss":"Beat|Miss|In-line"}],'
-        '"market_news":[{"headline":"","category":"Market|Macro|Sector|Policy|Global","sentiment":"Positive|Neutral|Negative"}],'
-        '"portfolio_news":[{"stock":"","headline":"","sentiment":"Positive|Neutral|Negative"}],'
-        '"fixed_income":{"gsec_10y":0.0,"gsec_5y":0.0,"gsec_1y":0.0,"repo_rate":0.0,'
-        '"rbi_stance":"","cpi_inflation":0.0,"aaa_spread_10y":0,"mibor_overnight":0.0,'
-        '"yield_curve_slope":0,"debt_market_view":""}}\n\n'
-        f"Search for:\n"
-        f"1. Indian corporate earnings results this week\n"
-        f"2. Indian stock market news today\n"
-        f"3. News for these stocks: {stock_list}\n"
-        f"4. India 10Y, 5Y, 1Y G-Sec yields today\n"
-        f"5. RBI repo rate and policy stance\n"
-        f"6. India CPI inflation latest\n"
-        f"7. AAA corporate bond spread over G-Sec (bps)\n"
-        f"8. MIBOR overnight rate\n\n"
-        "fixed_income field notes:\n"
-        "- yields in % (e.g. 6.85)\n"
-        "- rbi_stance: Accommodative/Neutral/Withdrawal of Accommodation/Hawkish\n"
-        "- aaa_spread_10y and yield_curve_slope in bps (e.g. 65)\n"
-        "- debt_market_view: one-line view on duration positioning\n"
-        "Include 3-5 earnings, 4-6 market news, 3-5 portfolio news. Real data only."
+        f"Today is {today}. Search web for Indian market data. Return ONLY JSON:\n"
+        '{"earnings":[{"company":"","result_date":"","revenue_growth_pct":0,"profit_growth_pct":0,"beat_miss":"Beat"}],'
+        '"market_news":[{"headline":"","category":"Market","sentiment":"Positive"}],'
+        '"portfolio_news":[{"stock":"","headline":"","sentiment":"Positive"}],'
+        '"fixed_income":{"gsec_10y":0.0,"gsec_1y":0.0,"repo_rate":0.0,"rbi_stance":"","cpi_inflation":0.0,"aaa_spread_10y":0,"debt_market_view":""}}\n'
+        f"Include: 3 earnings, 4 market news, 3 stock news for {stock_list[:50]}, fixed income data."
     )
     try:
         async with httpx.AsyncClient(timeout=120.0) as client:
