@@ -1078,59 +1078,22 @@ async def _fetch_news_and_earnings(api_key: str, stock_list: str) -> dict:
 
 @app.get("/debug-news")
 async def debug_news():
-    """Force a fresh news fetch — returns full raw debug info."""
+    """Force a fresh news fetch and return result."""
     global _news_cache
     _news_cache = {"data": None, "ts": 0.0}
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not api_key:
         return {"error": "ANTHROPIC_API_KEY not set"}
-    debug = {}
-    try:
-        from datetime import date
-        import json as _j
-        today = date.today().strftime("%d %B %Y")
-        prompt = f'Today is {today}. What is the current RBI repo rate and India 10-year G-Sec yield? Search the web and return ONLY JSON: {{"repo_rate": 0.0, "gsec_10y": 0.0}}'
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            resp1 = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
-                         "content-type": "application/json"},
-                json={"model": "claude-haiku-4-5-20251001", "max_tokens": 500,
-                      "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 2}],
-                      "messages": [{"role": "user", "content": prompt}]})
-            debug["step1_status"] = resp1.status_code
-            if resp1.status_code == 200:
-                r1 = resp1.json()
-                debug["stop_reason"] = r1.get("stop_reason")
-                debug["block_types"] = [b.get("type") for b in r1.get("content", [])]
-                debug["text_blocks"] = [b.get("text","")[:200] for b in r1.get("content",[]) if b.get("type")=="text"]
-                # If tool_use, send back
-                if r1.get("stop_reason") == "tool_use":
-                    assistant_content = r1.get("content", [])
-                    resp2 = await client.post(
-                        "https://api.anthropic.com/v1/messages",
-                        headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
-                                 "content-type": "application/json"},
-                        json={"model": "claude-haiku-4-5-20251001", "max_tokens": 500,
-                              "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 2}],
-                              "messages": [
-                                  {"role": "user", "content": prompt},
-                                  {"role": "assistant", "content": assistant_content},
-                                  {"role": "user", "content": [{"type": "text", "text": "Now return the JSON with real values from your search."}]}
-                              ]})
-                    debug["step2_status"] = resp2.status_code
-                    if resp2.status_code == 200:
-                        r2 = resp2.json()
-                        debug["step2_stop_reason"] = r2.get("stop_reason")
-                        debug["step2_block_types"] = [b.get("type") for b in r2.get("content", [])]
-                        debug["step2_text"] = [b.get("text","")[:300] for b in r2.get("content",[]) if b.get("type")=="text"]
-                    else:
-                        debug["step2_error"] = resp2.text[:200]
-            else:
-                debug["step1_error"] = resp1.text[:300]
-    except Exception as e:
-        debug["exception"] = str(e)
-    return debug
+    result = await _fetch_news_and_earnings(api_key, "HDFC Bank, Reliance, TCS")
+    return {
+        "keys": list(result.keys()),
+        "earnings_count": len(result.get("earnings", [])),
+        "news_count": len(result.get("market_news", [])),
+        "portfolio_news_count": len(result.get("portfolio_news", [])),
+        "fixed_income": result.get("fixed_income", {}),
+        "sample_news": result.get("market_news", [])[:2],
+    }
+
 
 @app.get("/debug-fii")
 async def debug_fii():
