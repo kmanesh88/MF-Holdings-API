@@ -1078,65 +1078,22 @@ async def _fetch_news_and_earnings(api_key: str, stock_list: str) -> dict:
 
 @app.get("/debug-news")
 async def debug_news():
-    """Debug: run full news fetch with raw response exposed."""
+    """Force a fresh news fetch — clears cache and returns result."""
     global _news_cache
     _news_cache = {"data": None, "ts": 0.0}
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not api_key:
         return {"error": "ANTHROPIC_API_KEY not set"}
-    import json as _j
-    from datetime import date
-    today = date.today().strftime("%d %B %Y")
-    prompt = (
-        f"Today is {today}. Search web for Indian market data. Return ONLY JSON:\n"
-        '{"earnings":[{"company":"","result_date":"","revenue_growth_pct":0,"profit_growth_pct":0,"beat_miss":"Beat"}],'
-        '"market_news":[{"headline":"","category":"Market","sentiment":"Positive"}],'
-        '"portfolio_news":[{"stock":"","headline":"","sentiment":"Positive"}],'
-        '"fixed_income":{"gsec_10y":0.0,"gsec_1y":0.0,"repo_rate":0.0,"rbi_stance":"","cpi_inflation":0.0,"aaa_spread_10y":0,"debt_market_view":""}}\n'
-        "Include: 3 earnings, 4 market news, 3 stock news for HDFC Bank Reliance TCS, fixed income data."
-    )
-    try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            resp1 = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
-                         "content-type": "application/json"},
-                json={"model": "claude-haiku-4-5-20251001", "max_tokens": 2500,
-                      "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 4}],
-                      "messages": [{"role": "user", "content": prompt}]})
-            if resp1.status_code != 200:
-                return {"error": resp1.text[:300]}
-            r1 = resp1.json()
-            stop_reason = r1.get("stop_reason")
-            blocks = r1.get("content", [])
-            block_types = [b.get("type") for b in blocks]
-            text_blocks = [b.get("text", "") for b in blocks if b.get("type") == "text"]
-            raw_text = " ".join(text_blocks).strip()
-            cleaned = re.sub(r"```[^\n]*\n?|```", "", raw_text).strip()
-            start = cleaned.find("{")
-            end = cleaned.rfind("}") + 1
-            parsed = None
-            parse_error = None
-            if start >= 0 and end > start:
-                try:
-                    parsed = _j.loads(cleaned[start:end])
-                except Exception as e:
-                    parse_error = str(e)
-                    parse_error_text = cleaned[start:start+200]
-            return {
-                "stop_reason": stop_reason,
-                "block_types": block_types,
-                "raw_text_len": len(raw_text),
-                "raw_text_preview": raw_text[:500],
-                "cleaned_preview": cleaned[:500],
-                "json_found": start >= 0 and end > start,
-                "parse_error": parse_error,
-                "parsed_keys": list(parsed.keys()) if parsed else [],
-                "fixed_income": parsed.get("fixed_income", {}) if parsed else {},
-                "news_count": len(parsed.get("market_news", [])) if parsed else 0,
-            }
-    except Exception as e:
-        return {"exception": str(e)}
+    result = await _fetch_news_and_earnings(api_key, "HDFC Bank, Reliance, TCS, Infosys, ICICI Bank")
+    return {
+        "status": "ok",
+        "news_count": len(result.get("market_news", [])),
+        "earnings_count": len(result.get("earnings", [])),
+        "portfolio_news_count": len(result.get("portfolio_news", [])),
+        "fixed_income": result.get("fixed_income", {}),
+        "sample_news": result.get("market_news", [])[:2],
+        "sample_earnings": result.get("earnings", [])[:2],
+    }
 
 
 @app.get("/debug-fii")
