@@ -1024,19 +1024,28 @@ async def _fetch_news_and_earnings(api_key: str, stock_list: str) -> dict:
     try:
         async with httpx.AsyncClient(timeout=120.0) as client:
             # Step 1: Call with web_search tool — Claude will search and return tool results
-            resp1 = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
-                         "content-type": "application/json"},
-                json={
-                    "model": "claude-haiku-4-5-20251001",
-                    "max_tokens": 4000,
-                    "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 8,
-                               "user_location": {"type": "approximate", "city": "Chennai",
-                                                 "region": "Tamil Nadu", "country": "IN",
-                                                 "timezone": "Asia/Kolkata"}}],
-                    "messages": [{"role": "user", "content": prompt}]
-                })
+            # Retry once on rate limit (429) after a short backoff
+            resp1 = None
+            for attempt in range(2):
+                resp1 = await client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
+                             "content-type": "application/json"},
+                    json={
+                        "model": "claude-haiku-4-5-20251001",
+                        "max_tokens": 2000,
+                        "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 4,
+                                   "user_location": {"type": "approximate", "city": "Chennai",
+                                                     "region": "Tamil Nadu", "country": "IN",
+                                                     "timezone": "Asia/Kolkata"}}],
+                        "messages": [{"role": "user", "content": prompt}]
+                    })
+                if resp1.status_code == 429 and attempt == 0:
+                    log.warning("News fetch hit rate limit, retrying in 15s...")
+                    import asyncio as _aio
+                    await _aio.sleep(15)
+                    continue
+                break
             if resp1.status_code != 200:
                 log.warning(f"News fetch step1 HTTP {resp1.status_code}: {resp1.text[:200]}")
                 return {"earnings": [], "market_news": [], "portfolio_news": [], "fixed_income": {}}
@@ -1064,7 +1073,7 @@ async def _fetch_news_and_earnings(api_key: str, stock_list: str) -> dict:
                     json={
                         "model": "claude-haiku-4-5-20251001",
                         "max_tokens": 2500,
-                        "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 8}],
+                        "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 4}],
                         "messages": [
                             {"role": "user", "content": prompt},
                             {"role": "assistant", "content": assistant_content},
