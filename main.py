@@ -896,46 +896,67 @@ async def _get_nse_session(client: httpx.AsyncClient):
     except Exception:
         pass
 
+YAHOO_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+}
+
 async def _fetch_indices() -> list:
-    """Fetch live index data from NSE."""
+    """Fetch live index data from Yahoo Finance (NSE direct scraping is blocked for
+    non-Indian/datacenter IPs — Yahoo's unauthenticated chart API is a reliable
+    free alternative that works from any server location)."""
     import time
     if _indices_cache["data"] and (time.time() - _indices_cache["ts"]) < 900:  # 15 min cache
         return _indices_cache["data"]
     results = []
+    # Yahoo Finance ticker symbols for Indian indices
     index_map = [
-        ("NIFTY 50",        "NIFTY%2050"),
-        ("NIFTY MIDCAP 150", "NIFTY%20MIDCAP%20150"),
-        ("NIFTY SMALLCAP 250", "NIFTY%20SMALLCAP%20250"),
-        ("NIFTY BANK",      "NIFTY%20BANK"),
-        ("INDIA VIX",       "INDIA%20VIX"),
-        ("NIFTY IT",        "NIFTY%20IT"),
+        ("NIFTY 50",          "%5ENSEI"),
+        ("NIFTY BANK",        "%5ENSEBANK"),
+        ("NIFTY MIDCAP 150",  "NIFTY_MIDCAP_150.NS"),
+        ("NIFTY SMALLCAP 250","NIFTY_SMLCAP_250.NS"),
+        ("INDIA VIX",         "%5EINDIAVIX"),
+        ("NIFTY IT",          "%5ECNXIT"),
     ]
     try:
         async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-            await _get_nse_session(client)
-            for label, enc in index_map:
+            for label, symbol in index_map:
                 try:
                     r = await client.get(
-                        f"https://www.nseindia.com/api/equity-stockIndices?index={enc}",
-                        headers=NSE_HEADERS, timeout=8.0)
+                        f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
+                        params={"range": "1y", "interval": "1d"},
+                        headers=YAHOO_HEADERS, timeout=8.0)
                     if r.status_code == 200:
                         d = r.json()
-                        meta = d.get("metadata", {})
+                        result = d.get("chart", {}).get("result")
+                        if not result:
+                            log.warning(f"Yahoo: no result for {label} ({symbol})")
+                            continue
+                        meta = result[0].get("meta", {})
+                        last_price  = meta.get("regularMarketPrice", 0)
+                        prev_close  = meta.get("chartPreviousClose") or meta.get("previousClose", 0)
+                        change      = round(last_price - prev_close, 2) if last_price and prev_close else 0
+                        change_pct  = round((change / prev_close) * 100, 2) if prev_close else 0
+                        # 52-week high/low from the year of daily closes returned
+                        closes = [c for c in (result[0].get("indicators",{}).get("quote",[{}])[0].get("close") or []) if c is not None]
+                        year_high = max(closes) if closes else meta.get("fiftyTwoWeekHigh", 0)
+                        year_low  = min(closes) if closes else meta.get("fiftyTwoWeekLow", 0)
                         results.append({
                             "name":      label,
-                            "value":     meta.get("last", 0),
-                            "change":    meta.get("change", 0),
-                            "changePct": meta.get("percentChange") or (round(meta.get("change",0)/meta.get("last",1)*100,2) if meta.get("last") else 0),
-                            "open":      meta.get("open", 0),
-                            "high":      meta.get("high", 0),
-                            "low":       meta.get("low", 0),
-                            "yearHigh":  meta.get("yearHigh", 0),
-                            "yearLow":   meta.get("yearLow", 0),
+                            "value":     round(last_price, 2),
+                            "change":    change,
+                            "changePct": change_pct,
+                            "open":      meta.get("regularMarketOpen", 0) or 0,
+                            "high":      meta.get("regularMarketDayHigh", 0) or 0,
+                            "low":       meta.get("regularMarketDayLow", 0) or 0,
+                            "yearHigh":  round(year_high, 2) if year_high else 0,
+                            "yearLow":   round(year_low, 2) if year_low else 0,
                         })
+                    else:
+                        log.warning(f"Yahoo fetch failed for {label}: HTTP {r.status_code}")
                 except Exception as e:
                     log.warning(f"Index fetch failed for {label}: {e}")
     except Exception as e:
-        log.warning(f"NSE session failed: {e}")
+        log.warning(f"Yahoo Finance session failed: {e}")
     if results:
         _indices_cache["data"] = results
         _indices_cache["ts"]   = time.time()
@@ -1095,6 +1116,32 @@ async def debug_news():
         "sample_earnings": result.get("earnings", [])[:2],
     }
 
+
+@app.get("/debug-yahoo")
+async def debug_yahoo():
+    """Debug: test each Yahoo Finance index symbol individually."""
+    global _indices_cache
+    _indices_cache = {"data": None, "ts": 0.0}
+    test_symbols = [
+        ("NIFTY 50", "%5ENSEI"),
+        ("NIFTY BANK", "%5ENSEBANK"),
+        ("NIFTY MIDCAP 150", "NIFTY_MIDCAP_150.NS"),
+        ("NIFTY SMALLCAP 250", "NIFTY_SMLCAP_250.NS"),
+        ("INDIA VIX", "%5EINDIAVIX"),
+        ("NIFTY IT", "%5ECNXIT"),
+    ]
+    results = {}
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+        for label, symbol in test_symbols:
+            try:
+                r = await client.get(
+                    f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
+                    params={"range": "5d", "interval": "1d"},
+                    headers=YAHOO_HEADERS, timeout=8.0)
+                results[label] = {"status": r.status_code, "body": r.text[:300]}
+            except Exception as e:
+                results[label] = {"error": str(e)}
+    return results
 
 @app.get("/debug-indices")
 async def debug_indices():
