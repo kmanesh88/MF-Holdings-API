@@ -1096,6 +1096,27 @@ async def debug_news():
     }
 
 
+@app.get("/debug-indices")
+async def debug_indices():
+    """Debug: show raw NSE response for the indices endpoint."""
+    global _indices_cache
+    _indices_cache = {"data": None, "ts": 0.0}  # clear cache to force fresh fetch
+    results = {}
+    try:
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+            session_resp = await client.get("https://www.nseindia.com", headers=NSE_HEADERS, timeout=10.0)
+            results["session_status"] = session_resp.status_code
+            results["session_cookies"] = list(client.cookies.keys())
+
+            r = await client.get(
+                "https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%2050",
+                headers=NSE_HEADERS, timeout=8.0)
+            results["index_status"] = r.status_code
+            results["index_raw"] = r.text[:500]
+    except Exception as e:
+        results["exception"] = str(e)
+    return results
+
 @app.get("/debug-fii")
 async def debug_fii():
     """Debug endpoint — shows raw NSE FII/DII response for field inspection."""
