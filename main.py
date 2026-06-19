@@ -1097,6 +1097,99 @@ async def _fetch_news_and_earnings(api_key: str, stock_list: str) -> dict:
         log.warning(f"News fetch failed: {e}")
     return {"earnings": [], "market_news": [], "portfolio_news": [], "fixed_income": {}}
 
+@app.get("/debug-news-raw")
+async def debug_news_raw():
+    """Debug: expose raw HTTP status/body at each step of the news fetch chain."""
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        return {"error": "ANTHROPIC_API_KEY not set"}
+    import json as _j
+    from datetime import date
+    today = date.today().strftime("%d %B %Y")
+    prompt = (
+        f"Today is {today}. Search web for Indian market data. Return ONLY JSON:\n"
+        '{"earnings":[{"company":"","result_date":"","revenue_growth_pct":0,"profit_growth_pct":0,"beat_miss":"Beat"}],'
+        '"market_news":[{"headline":"","category":"Market","sentiment":"Positive"}],'
+        '"portfolio_news":[{"stock":"","headline":"","sentiment":"Positive"}],'
+        '"fixed_income":{"gsec_10y":0.0,"gsec_1y":0.0,"repo_rate":0.0,"rbi_stance":"","cpi_inflation":0.0,"aaa_spread_10y":0,"debt_market_view":""}}\n'
+        "Include: 3 earnings, 4 market news, 3 stock news for HDFC Bank Reliance TCS, fixed income data."
+    )
+    debug = {}
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            resp1 = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
+                         "content-type": "application/json"},
+                json={
+                    "model": "claude-haiku-4-5-20251001",
+                    "max_tokens": 4000,
+                    "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 8}],
+                    "messages": [{"role": "user", "content": prompt}]
+                })
+            debug["step1_status"] = resp1.status_code
+            if resp1.status_code != 200:
+                debug["step1_error"] = resp1.text[:500]
+                return debug
+            r1 = resp1.json()
+            debug["step1_stop_reason"] = r1.get("stop_reason")
+            debug["step1_block_types"] = [b.get("type") for b in r1.get("content", [])]
+            assistant_content = r1.get("content", [])
+
+            if r1.get("stop_reason") == "tool_use":
+                tool_results = []
+                for block in assistant_content:
+                    if block.get("type") == "web_search_tool_result":
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.get("tool_use_id"),
+                            "content": block.get("content", [])
+                        })
+                debug["tool_results_count"] = len(tool_results)
+                resp2 = await client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
+                             "content-type": "application/json"},
+                    json={
+                        "model": "claude-haiku-4-5-20251001",
+                        "max_tokens": 2500,
+                        "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 8}],
+                        "messages": [
+                            {"role": "user", "content": prompt},
+                            {"role": "assistant", "content": assistant_content},
+                            {"role": "user", "content": tool_results if tool_results else
+                             [{"type": "text", "text": "Based on the search results above, provide the JSON."}]}
+                        ]
+                    })
+                debug["step2_status"] = resp2.status_code
+                if resp2.status_code != 200:
+                    debug["step2_error"] = resp2.text[:500]
+                    return debug
+                r2 = resp2.json()
+                debug["step2_stop_reason"] = r2.get("stop_reason")
+                debug["step2_block_types"] = [b.get("type") for b in r2.get("content", [])]
+                final_blocks = r2.get("content", [])
+            else:
+                final_blocks = assistant_content
+
+            text = " ".join(b.get("text", "") for b in final_blocks if b.get("type") == "text").strip()
+            debug["raw_text_len"] = len(text)
+            debug["raw_text_preview"] = text[:600]
+            cleaned = re.sub(r"```[^\n]*\n?|```", "", text).strip()
+            start = cleaned.find("{")
+            end = cleaned.rfind("}") + 1
+            debug["json_found"] = start >= 0 and end > start
+            if debug["json_found"]:
+                try:
+                    parsed = _j.loads(cleaned[start:end])
+                    debug["parsed_keys"] = list(parsed.keys())
+                    debug["news_count"] = len(parsed.get("market_news", []))
+                except Exception as e:
+                    debug["parse_error"] = str(e)
+    except Exception as e:
+        debug["exception"] = str(e)
+    return debug
+
 @app.get("/debug-news")
 async def debug_news():
     """Force a fresh news fetch — clears cache and returns result."""
