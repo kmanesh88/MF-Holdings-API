@@ -1014,12 +1014,20 @@ async def _fetch_news_and_earnings(api_key: str, stock_list: str) -> dict:
     from datetime import date
     today = date.today().strftime("%d %B %Y")
     prompt = (
-        f"Today is {today}. Search web for Indian market data. Return ONLY JSON:\n"
+        f"Today is {today}. Search the web for the MOST RECENT Indian market news, earnings, "
+        f"and fixed income data you can find — it does not need to be from today specifically, "
+        f"the most recent available data within the last 1-2 weeks is perfectly fine.\n\n"
+        f"IMPORTANT: You must always return the JSON below, using your best available recent data. "
+        f"Never apologize, never explain limitations, never refuse — just fill in the JSON with the "
+        f"most recent real figures you found, even if approximate or slightly dated. If something is "
+        f"truly unavailable use null, but still output the full JSON structure.\n\n"
+        "Return ONLY the JSON object, no other text:\n"
         '{"earnings":[{"company":"","result_date":"","revenue_growth_pct":0,"profit_growth_pct":0,"beat_miss":"Beat"}],'
         '"market_news":[{"headline":"","category":"Market","sentiment":"Positive"}],'
         '"portfolio_news":[{"stock":"","headline":"","sentiment":"Positive"}],'
-        '"fixed_income":{"gsec_10y":0.0,"gsec_1y":0.0,"repo_rate":0.0,"rbi_stance":"","cpi_inflation":0.0,"aaa_spread_10y":0,"debt_market_view":""}}\n'
-        f"Include: 3 earnings, 4 market news, 3 stock news for {stock_list[:50]}, fixed income data."
+        '"fixed_income":{"gsec_10y":0.0,"gsec_1y":0.0,"repo_rate":0.0,"rbi_stance":"","cpi_inflation":0.0,"aaa_spread_10y":0,"debt_market_view":""}}\n\n'
+        f"Include: 3 earnings, 4 market news, 3 stock news items for {stock_list[:50]}, and fixed income data. "
+        f"Remember: output ONLY the JSON, with your best recent data filled in — no apology text, no caveats."
     )
     try:
         async with httpx.AsyncClient(timeout=120.0) as client:
@@ -1116,12 +1124,20 @@ async def debug_news_raw():
     from datetime import date
     today = date.today().strftime("%d %B %Y")
     prompt = (
-        f"Today is {today}. Search web for Indian market data. Return ONLY JSON:\n"
+        f"Today is {today}. Search the web for the MOST RECENT Indian market news, earnings, "
+        f"and fixed income data you can find — it does not need to be from today specifically, "
+        f"the most recent available data within the last 1-2 weeks is perfectly fine.\n\n"
+        f"IMPORTANT: You must always return the JSON below, using your best available recent data. "
+        f"Never apologize, never explain limitations, never refuse — just fill in the JSON with the "
+        f"most recent real figures you found, even if approximate or slightly dated. If something is "
+        f"truly unavailable use null, but still output the full JSON structure.\n\n"
+        "Return ONLY the JSON object, no other text:\n"
         '{"earnings":[{"company":"","result_date":"","revenue_growth_pct":0,"profit_growth_pct":0,"beat_miss":"Beat"}],'
         '"market_news":[{"headline":"","category":"Market","sentiment":"Positive"}],'
         '"portfolio_news":[{"stock":"","headline":"","sentiment":"Positive"}],'
-        '"fixed_income":{"gsec_10y":0.0,"gsec_1y":0.0,"repo_rate":0.0,"rbi_stance":"","cpi_inflation":0.0,"aaa_spread_10y":0,"debt_market_view":""}}\n'
-        "Include: 3 earnings, 4 market news, 3 stock news for HDFC Bank Reliance TCS, fixed income data."
+        '"fixed_income":{"gsec_10y":0.0,"gsec_1y":0.0,"repo_rate":0.0,"rbi_stance":"","cpi_inflation":0.0,"aaa_spread_10y":0,"debt_market_view":""}}\n\n'
+        "Include: 3 earnings, 4 market news, 3 stock news items for HDFC Bank Reliance TCS, and fixed income data. "
+        "Remember: output ONLY the JSON, with your best recent data filled in — no apology text, no caveats."
     )
     debug = {}
     try:
