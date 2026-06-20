@@ -1016,17 +1016,26 @@ async def _fetch_news_and_earnings(api_key: str, stock_list: str) -> dict:
     prompt = (
         f"Today is {today}. Search the web for the MOST RECENT Indian market news, earnings, "
         f"and fixed income data you can find — it does not need to be from today specifically, "
-        f"the most recent available data within the last 1-2 weeks is perfectly fine.\n\n"
+        f"the most recent available data within the last 2-4 weeks is perfectly fine.\n\n"
+        f"Run SEPARATE, SPECIFIC searches for each of these fixed income data points — do not "
+        f"combine them into one vague search:\n"
+        f"1. \"India 10 year government bond yield today\" — for gsec_10y\n"
+        f"2. \"India 1 year treasury bill yield rate\" — for gsec_1y\n"
+        f"3. \"RBI repo rate current\" — for repo_rate and rbi_stance\n"
+        f"4. \"India CPI inflation rate latest month\" — for cpi_inflation\n"
+        f"5. \"India AAA corporate bond spread over government bond\" or \"AAA bond yield India\" — for aaa_spread_10y "
+        f"(if you find AAA corporate bond yield but not the spread, calculate spread = AAA yield - gsec_10y, in basis points)\n\n"
         f"IMPORTANT: You must always return the JSON below, using your best available recent data. "
         f"Never apologize, never explain limitations, never refuse — just fill in the JSON with the "
-        f"most recent real figures you found, even if approximate or slightly dated. If something is "
-        f"truly unavailable use null, but still output the full JSON structure.\n\n"
+        f"most recent real figures you found, even if approximate or slightly dated. Only use null if "
+        f"you genuinely found nothing after searching — but try all 5 searches above before giving up "
+        f"on any field.\n\n"
         "Return ONLY the JSON object, no other text:\n"
         '{"earnings":[{"company":"","result_date":"","revenue_growth_pct":0,"profit_growth_pct":0,"beat_miss":"Beat"}],'
         '"market_news":[{"headline":"","category":"Market","sentiment":"Positive"}],'
         '"portfolio_news":[{"stock":"","headline":"","sentiment":"Positive"}],'
         '"fixed_income":{"gsec_10y":0.0,"gsec_1y":0.0,"repo_rate":0.0,"rbi_stance":"","cpi_inflation":0.0,"aaa_spread_10y":0,"debt_market_view":""}}\n\n'
-        f"Include: 3 earnings, 4 market news, 3 stock news items for {stock_list[:50]}, and fixed income data. "
+        f"Include: 3 earnings, 4 market news, 3 stock news items for {stock_list[:50]}, and all 6 fixed income fields. "
         f"Remember: output ONLY the JSON, with your best recent data filled in — no apology text, no caveats."
     )
     try:
@@ -1042,7 +1051,7 @@ async def _fetch_news_and_earnings(api_key: str, stock_list: str) -> dict:
                     json={
                         "model": "claude-haiku-4-5-20251001",
                         "max_tokens": 2000,
-                        "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 4,
+                        "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 7,
                                    "user_location": {"type": "approximate", "city": "Chennai",
                                                      "region": "Tamil Nadu", "country": "IN",
                                                      "timezone": "Asia/Kolkata"}}],
@@ -1081,7 +1090,7 @@ async def _fetch_news_and_earnings(api_key: str, stock_list: str) -> dict:
                     json={
                         "model": "claude-haiku-4-5-20251001",
                         "max_tokens": 2500,
-                        "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 4}],
+                        "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 7}],
                         "messages": [
                             {"role": "user", "content": prompt},
                             {"role": "assistant", "content": assistant_content},
