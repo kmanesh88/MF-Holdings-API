@@ -1020,22 +1020,25 @@ async def _fetch_news_and_earnings(api_key: str, stock_list: str) -> dict:
         f"Run SEPARATE, SPECIFIC searches for each of these fixed income data points — do not "
         f"combine them into one vague search:\n"
         f"1. \"India 10 year government bond yield today\" — for gsec_10y\n"
-        f"2. \"India 1 year treasury bill yield rate\" — for gsec_1y\n"
-        f"3. \"RBI repo rate current\" — for repo_rate and rbi_stance\n"
-        f"4. \"India CPI inflation rate latest month\" — for cpi_inflation\n"
-        f"5. \"India AAA corporate bond spread over government bond\" or \"AAA bond yield India\" — for aaa_spread_10y "
-        f"(if you find AAA corporate bond yield but not the spread, calculate spread = AAA yield - gsec_10y, in basis points)\n\n"
+        f"2. \"India 5 year government bond yield today\" — for gsec_5y\n"
+        f"3. \"India 1 year treasury bill yield rate\" — for gsec_1y\n"
+        f"4. \"RBI repo rate current\" — for repo_rate and rbi_stance\n"
+        f"5. \"India CPI inflation rate latest month\" — for cpi_inflation\n"
+        f"6. \"India AAA corporate bond spread over government bond\" or \"AAA bond yield India\" — for aaa_spread_10y "
+        f"(if you find AAA corporate bond yield but not the spread, calculate spread = AAA yield - gsec_10y, in basis points)\n"
+        f"7. \"India MIBOR overnight rate today\" or \"India overnight call money rate\" — for mibor_overnight\n\n"
+        f"After finding gsec_10y and gsec_1y, calculate yield_curve_slope = (gsec_10y - gsec_1y) * 100, in basis points.\n\n"
         f"IMPORTANT: You must always return the JSON below, using your best available recent data. "
         f"Never apologize, never explain limitations, never refuse — just fill in the JSON with the "
         f"most recent real figures you found, even if approximate or slightly dated. Only use null if "
-        f"you genuinely found nothing after searching — but try all 5 searches above before giving up "
+        f"you genuinely found nothing after searching — but try all 7 searches above before giving up "
         f"on any field.\n\n"
         "Return ONLY the JSON object, no other text:\n"
         '{"earnings":[{"company":"","result_date":"","revenue_growth_pct":0,"profit_growth_pct":0,"beat_miss":"Beat"}],'
         '"market_news":[{"headline":"","category":"Market","sentiment":"Positive"}],'
         '"portfolio_news":[{"stock":"","headline":"","sentiment":"Positive"}],'
-        '"fixed_income":{"gsec_10y":0.0,"gsec_1y":0.0,"repo_rate":0.0,"rbi_stance":"","cpi_inflation":0.0,"aaa_spread_10y":0,"debt_market_view":""}}\n\n'
-        f"Include: 3 earnings, 4 market news, 3 stock news items for {stock_list[:50]}, and all 6 fixed income fields. "
+        '"fixed_income":{"gsec_10y":0.0,"gsec_5y":0.0,"gsec_1y":0.0,"repo_rate":0.0,"rbi_stance":"","cpi_inflation":0.0,"aaa_spread_10y":0,"mibor_overnight":0.0,"yield_curve_slope":0,"debt_market_view":""}}\n\n'
+        f"Include: 3 earnings, 4 market news, 3 stock news items for {stock_list[:50]}, and all 9 fixed income fields. "
         f"Remember: output ONLY the JSON, with your best recent data filled in — no apology text, no caveats."
     )
     try:
