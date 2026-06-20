@@ -8,7 +8,7 @@ Formats confirmed:
   E: UTI — Single sheet, SCHEME CODE###STARTS/ENDS markers
 """
 
-import os, re, io, logging, json, zipfile, httpx, asyncio
+import os, re, io, logging, json, zipfile, httpx, asyncio, time
 from datetime import datetime, date
 from typing import Optional, List
 from pathlib import Path
@@ -104,6 +104,206 @@ def load_db():
             holdings_db = json.loads(DB_FILE.read_text())
             log.info(f"Loaded {len(holdings_db)} funds from disk")
     except Exception as e: log.warning(f"Load failed: {e}")
+
+# AMC UPLOAD AGENT -- Plan, Act, Verify, Repair, Report
+# Same shape as the market-data agent, applied to stock classification
+# gaps in uploaded AMC disclosures:
+#   1. PLAN   -- every equity holding should resolve a real cap
+#                classification (large/mid/small) via ISIN or name match
+#   2. ACT    -- the existing parser + _enrich_holdings already does this
+#   3. VERIFY -- find holdings that fell through to the silent "small"
+#                default because neither ISIN nor name matched anything
+#   4. REPAIR -- one cached AI lookup per genuinely-unresolved stock,
+#                resolved once, cached permanently by ISIN (or normalized
+#                name if ISIN is missing), so the same stock is never
+#                billed for twice across uploads
+#   5. REPORT -- a per-upload health record, kept in a rolling log and
+#                viewable via /amc-health
+
+CAP_CACHE_FILE = DATA_DIR / "cap_resolution_cache.json"
+_cap_resolution_cache: dict = {}
+
+def _load_cap_cache():
+    global _cap_resolution_cache
+    try:
+        if CAP_CACHE_FILE.exists():
+            _cap_resolution_cache = json.loads(CAP_CACHE_FILE.read_text())
+            log.info(f"Cap resolution cache loaded: {len(_cap_resolution_cache)} entries")
+    except Exception as e:
+        log.warning(f"Cap cache load failed: {e}")
+
+def _save_cap_cache():
+    try:
+        CAP_CACHE_FILE.write_text(json.dumps(_cap_resolution_cache, ensure_ascii=False))
+    except Exception as e:
+        log.warning(f"Cap cache save failed: {e}")
+
+_load_cap_cache()
+
+_amc_health: list = []
+_AMC_HEALTH_MAX = 30
+
+def _amc_health_log(report: dict):
+    report["ts"] = time.time()
+    report["time_str"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    _amc_health.insert(0, report)
+    while len(_amc_health) > _AMC_HEALTH_MAX:
+        _amc_health.pop()
+
+def _agent_verify_amc(fund_data: dict, enriched_holdings: list) -> dict:
+    """VERIFY step for one fund -- find equity holdings whose cap classification
+    fell through to the silent 'small' default with no real match behind it
+    (no ISIN hit, no AMFI name hit, no override, no cache hit)."""
+    unresolved = []
+    cap_map = _amfi_cap_map()
+    for h in enriched_holdings:
+        if h.get("type") == "debt":
+            continue
+        isin = (h.get("isin") or "").strip()
+        name = h.get("name") or ""
+        real_match = False
+        if isin and AMFI_ISIN_CAP.get(isin) is not None:
+            real_match = True
+        elif isin and _cap_resolution_cache.get(isin, {}).get("cap"):
+            real_match = True
+        else:
+            key = _norm_stock(name)
+            if cap_map.get(key) is not None:
+                real_match = True
+            elif _cap_resolution_cache.get(key, {}).get("cap"):
+                real_match = True
+        if not real_match:
+            unresolved.append({"name": name, "isin": isin})
+    return {"ok": not unresolved, "unresolved": unresolved}
+
+async def _agent_repair_cap(api_key: str, stock_name: str, isin: str = "") -> Optional[str]:
+    """REPAIR step -- resolve ONE stock's market-cap category via Claude + web
+    search, then cache the result permanently keyed by ISIN (preferred) or
+    normalized name. Returns 'large' | 'mid' | 'small' | None."""
+    cache_key = isin if isin else _norm_stock(stock_name)
+    cached = _cap_resolution_cache.get(cache_key)
+    if cached and cached.get("cap"):
+        return cached["cap"]
+
+    if not api_key:
+        return None
+
+    prompt = (
+        f'What is the SEBI/AMFI market capitalisation category of the Indian listed '
+        f'company "{stock_name}"{f" (ISIN {isin})" if isin else ""} -- is it Large Cap '
+        f'(top 100 by market cap), Mid Cap (101-250), or Small Cap (251+)? '
+        f'Search the web for its current market capitalisation and AMFI classification. '
+        f'Return ONLY one word: "large", "mid", or "small". If you cannot determine it '
+        f'with reasonable confidence after searching, return "unknown".'
+    )
+    try:
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
+                         "content-type": "application/json"},
+                json={
+                    "model": "claude-haiku-4-5-20251001",
+                    "max_tokens": 200,
+                    "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 2}],
+                    "messages": [{"role": "user", "content": prompt}]
+                })
+            if resp.status_code != 200:
+                log.warning(f"Cap repair HTTP {resp.status_code} for '{stock_name}'")
+                return None
+            data = resp.json()
+            blocks = data.get("content", [])
+            if data.get("stop_reason") == "tool_use":
+                tool_results = [
+                    {"type": "tool_result", "tool_use_id": b.get("tool_use_id"), "content": b.get("content", [])}
+                    for b in blocks if b.get("type") == "web_search_tool_result"
+                ]
+                resp2 = await client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
+                             "content-type": "application/json"},
+                    json={
+                        "model": "claude-haiku-4-5-20251001",
+                        "max_tokens": 100,
+                        "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 2}],
+                        "messages": [
+                            {"role": "user", "content": prompt},
+                            {"role": "assistant", "content": blocks},
+                            {"role": "user", "content": tool_results if tool_results else
+                             [{"type": "text", "text": "Answer now with one word based on the search results."}]}
+                        ]
+                    })
+                blocks = resp2.json().get("content", []) if resp2.status_code == 200 else blocks
+            text = " ".join(b.get("text", "") for b in blocks if b.get("type") == "text").strip().lower()
+            cap = next((c for c in ("large", "mid", "small") if c in text), None)
+            if cap:
+                _cap_resolution_cache[cache_key] = {
+                    "cap": cap, "name": stock_name, "source": "ai_repair", "resolved_at": time.time()
+                }
+                _save_cap_cache()
+                log.info(f"Agent repair resolved '{stock_name}' -> {cap}")
+            return cap
+    except Exception as e:
+        log.warning(f"Cap repair failed for '{stock_name}': {e}")
+    return None
+
+async def _run_amc_upload_agent(amc_name: str, parsed_funds: dict, api_key: str = ""):
+    """Full agent cycle for one AMC upload -- verify every fund's enriched
+    holdings, repair genuinely unresolved stocks (capped per upload to keep
+    cost bounded), and log a per-AMC health report."""
+    report = {"amc": amc_name, "funds": [], "total_unresolved": 0, "total_repaired": 0}
+    MAX_REPAIRS_PER_UPLOAD = 15
+    repairs_done = 0
+
+    for key, fund_data in parsed_funds.items():
+        enriched = _enrich_holdings(fund_data)["holdings"]
+        verdict = _agent_verify_amc(fund_data, enriched)
+        fund_report = {
+            "fund_name": fund_data.get("fund_name", key),
+            "holdings_count": len(enriched),
+            "unresolved_count": len(verdict["unresolved"]),
+            "repaired": [],
+        }
+        report["total_unresolved"] += len(verdict["unresolved"])
+
+        if verdict["unresolved"] and api_key and repairs_done < MAX_REPAIRS_PER_UPLOAD:
+            for item in verdict["unresolved"]:
+                if repairs_done >= MAX_REPAIRS_PER_UPLOAD:
+                    break
+                cap = await _agent_repair_cap(api_key, item["name"], item["isin"])
+                repairs_done += 1
+                if cap and cap != "unknown":
+                    fund_report["repaired"].append({"name": item["name"], "cap": cap})
+                    report["total_repaired"] += 1
+
+        report["funds"].append(fund_report)
+
+    report["repairs_used"] = repairs_done
+    report["repairs_capped"] = repairs_done >= MAX_REPAIRS_PER_UPLOAD
+    _amc_health_log(report)
+    log.info(f"AMC agent [{amc_name}]: {report['total_unresolved']} unresolved, "
+             f"{report['total_repaired']} repaired via AI, {repairs_done} repair calls used")
+    return report
+
+@app.get("/amc-health")
+async def amc_health():
+    """Visible health log -- last N AMC upload cycles with per-fund verify/repair detail."""
+    return {"uploads_logged": len(_amc_health), "history": _amc_health,
+            "cap_cache_size": len(_cap_resolution_cache)}
+
+@app.post("/amc-health/recheck")
+async def amc_health_recheck(amc: str = Query(...), secret: str = ""):
+    """Manually re-run the verify/repair agent against an AMC already in
+    holdings_db, without needing to re-upload the file. Useful for backfilling
+    health checks on AMCs uploaded before this agent existed."""
+    check_secret(secret)
+    matching = {k: v for k, v in holdings_db.items()
+                if v.get("amc", "").lower() == amc.lower()}
+    if not matching:
+        raise HTTPException(404, f"No funds found for AMC '{amc}'")
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    report = await _run_amc_upload_agent(amc, matching, api_key)
+    return report
 
 def norm(s: str) -> str:
     n = str(s).lower().strip()
@@ -745,6 +945,7 @@ async def upload(
     """Upload AMC portfolio Excel/ZIP. Auto-detects format."""
     check_secret(secret)
     total_funds = 0; fund_names = []
+    all_parsed = {}
     for f in files:
         fname = f.filename or "upload"
         if not re.search(r'\.(xlsx|xls|zip)$', fname, re.I): continue
@@ -752,6 +953,7 @@ async def upload(
         parsed = process_upload(raw, fname, amc.strip())
         if parsed:
             holdings_db.update(parsed)
+            all_parsed.update(parsed)
             total_funds += len(parsed)
             fund_names.extend(v["fund_name"] for v in parsed.values())
             log.info(f"[{amc}] '{fname}' -> {len(parsed)} funds")
@@ -759,6 +961,14 @@ async def upload(
     if total_funds == 0:
         raise HTTPException(422, "No fund data found — check file format")
     save_db()
+
+    # Fire the verify/repair agent in the background — doesn't block the
+    # upload response, but runs immediately so /amc-health reflects this
+    # upload within a few seconds rather than requiring a manual trigger.
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if all_parsed:
+        asyncio.create_task(_run_amc_upload_agent(amc.strip(), all_parsed, api_key))
+
     return {"status": "ok", "amc": amc, "files": len(files),
             "funds_added": total_funds, "funds_total": len(holdings_db),
             "funds": fund_names}
