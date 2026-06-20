@@ -8,8 +8,8 @@ Formats confirmed:
   E: UTI — Single sheet, SCHEME CODE###STARTS/ENDS markers
 """
 
-import os, re, io, logging, json, zipfile, httpx
-from datetime import datetime
+import os, re, io, logging, json, zipfile, httpx, asyncio
+from datetime import datetime, date
 from typing import Optional, List
 from pathlib import Path
 
@@ -1006,12 +1006,155 @@ async def _fetch_fii_dii() -> dict:
         log.warning(f"FII/DII fetch failed: {e}")
     return {}
 
+# ════════════════════════════════════════════════════════════════
+# MARKET DATA AGENT — Plan → Act → Verify → Repair → Report
+#
+# Replaces the old single-shot fetch with a self-checking loop:
+#   1. PLAN   — decide what fields are required and how to search for them
+#   2. ACT    — call Claude with web_search, run the searches
+#   3. VERIFY — check the result against a schema: which fields are
+#               present, missing, or implausible
+#   4. REPAIR — if anything is missing, run ONE targeted follow-up
+#               call asking specifically for the gaps (cheap — small
+#               prompt, no full re-search of everything)
+#   5. REPORT — every cycle is logged to _agent_health with what
+#               happened, so failures are visible via /agent-health
+#               instead of being discovered by chance
+# ════════════════════════════════════════════════════════════════
+
+REQUIRED_FIXED_INCOME_FIELDS = [
+    "gsec_10y", "gsec_5y", "gsec_1y", "repo_rate", "rbi_stance",
+    "cpi_inflation", "aaa_spread_10y", "mibor_overnight", "yield_curve_slope",
+]
+
+# Sensible recent fallback values — used only as an absolute last resort,
+# always flagged to the client as estimated (never silently substituted).
+FIXED_INCOME_FALLBACKS = {
+    "gsec_10y": 6.85, "gsec_5y": 6.55, "gsec_1y": 6.45,
+    "repo_rate": 5.25, "rbi_stance": "Neutral", "cpi_inflation": 3.2,
+    "aaa_spread_10y": 55, "mibor_overnight": 5.3, "yield_curve_slope": 40,
+}
+
+_agent_health: list = []  # ring buffer of recent fetch-cycle reports, newest first
+_AGENT_HEALTH_MAX = 20
+
+def _agent_log(report: dict):
+    """Record a fetch-cycle report into the rolling health log."""
+    import time
+    report["ts"] = time.time()
+    report["time_str"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    _agent_health.insert(0, report)
+    while len(_agent_health) > _AGENT_HEALTH_MAX:
+        _agent_health.pop()
+
+def _agent_verify(result: dict) -> dict:
+    """VERIFY step — inspect the result and report what's missing or implausible.
+    Returns {"ok": bool, "missing_fixed_income": [...], "issues": [...]}.
+    """
+    issues = []
+    fi = result.get("fixed_income") or {}
+    missing = [f for f in REQUIRED_FIXED_INCOME_FIELDS if fi.get(f) in (None, "")]
+
+    # Plausibility checks — catch cases where the model returned a number
+    # that's technically present but nonsensical (e.g. a string, a wildly
+    # out-of-range yield from a misread search result)
+    for yield_field in ("gsec_10y", "gsec_5y", "gsec_1y", "repo_rate", "mibor_overnight"):
+        v = fi.get(yield_field)
+        if v is not None and not (0 < float(v) < 20):
+            issues.append(f"{yield_field}={v} looks implausible (expected 0-20%)")
+            missing.append(yield_field)  # treat as missing — will attempt repair
+
+    if not result.get("market_news"):
+        issues.append("market_news is empty")
+    if not result.get("earnings"):
+        issues.append("earnings is empty")
+
+    return {
+        "ok": not missing and not issues,
+        "missing_fixed_income": sorted(set(missing)),
+        "issues": issues,
+    }
+
+async def _agent_repair(api_key: str, missing_fields: list) -> dict:
+    """REPAIR step — one small, targeted follow-up call asking ONLY for the
+    fields that came back missing/implausible. Cheap (short prompt, few
+    searches) compared to re-running the full fetch.
+    """
+    if not missing_fields:
+        return {}
+    field_hints = {
+        "gsec_10y": 'search "India 10 year government bond yield today"',
+        "gsec_5y": 'search "India 5 year government bond yield today"',
+        "gsec_1y": 'search "India 1 year treasury bill yield rate"',
+        "repo_rate": 'search "RBI repo rate current"',
+        "rbi_stance": 'search "RBI monetary policy stance latest"',
+        "cpi_inflation": 'search "India CPI inflation rate latest month"',
+        "aaa_spread_10y": 'search "India AAA corporate bond yield" and subtract gsec_10y, result in bps',
+        "mibor_overnight": 'search "India MIBOR overnight rate" or "overnight call money rate"',
+        "yield_curve_slope": "calculate (gsec_10y - gsec_1y) * 100 in bps from already-known yields",
+    }
+    lines = [f"- {f}: {field_hints.get(f, 'search for ' + f)}" for f in missing_fields]
+    schema = {f: (0.0 if f != "rbi_stance" else "") for f in missing_fields}
+    prompt = (
+        f"Find ONLY these specific India fixed-income data points, nothing else:\n"
+        + "\n".join(lines) +
+        f"\n\nReturn ONLY this JSON with the values you found (use null only if truly unavailable "
+        f"after searching): {json.dumps(schema)}"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
+                         "content-type": "application/json"},
+                json={
+                    "model": "claude-haiku-4-5-20251001",
+                    "max_tokens": 500,
+                    "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 4}],
+                    "messages": [{"role": "user", "content": prompt}]
+                })
+            if resp.status_code != 200:
+                log.warning(f"Agent repair HTTP {resp.status_code}: {resp.text[:150]}")
+                return {}
+            data = resp.json()
+            blocks = data.get("content", [])
+            if data.get("stop_reason") == "tool_use":
+                tool_results = [
+                    {"type": "tool_result", "tool_use_id": b.get("tool_use_id"), "content": b.get("content", [])}
+                    for b in blocks if b.get("type") == "web_search_tool_result"
+                ]
+                resp2 = await client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
+                             "content-type": "application/json"},
+                    json={
+                        "model": "claude-haiku-4-5-20251001",
+                        "max_tokens": 400,
+                        "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 4}],
+                        "messages": [
+                            {"role": "user", "content": prompt},
+                            {"role": "assistant", "content": blocks},
+                            {"role": "user", "content": tool_results if tool_results else
+                             [{"type": "text", "text": "Provide the JSON now based on search results."}]}
+                        ]
+                    })
+                blocks = resp2.json().get("content", []) if resp2.status_code == 200 else blocks
+            text = " ".join(b.get("text", "") for b in blocks if b.get("type") == "text").strip()
+            text = re.sub(r"```[^\n]*\n?|```", "", text).strip()
+            start, end = text.find("{"), text.rfind("}") + 1
+            if start >= 0 and end > start:
+                return json.loads(text[start:end])
+    except Exception as e:
+        log.warning(f"Agent repair failed: {e}")
+    return {}
+
 async def _fetch_news_and_earnings(api_key: str, stock_list: str) -> dict:
-    """Use Claude with web_search to fetch real market news and earnings."""
-    import time, json as _j
+    """Agent entry point — PLAN, ACT, VERIFY, REPAIR, REPORT."""
+    import time
     if _news_cache["data"] and (time.time() - _news_cache["ts"]) < 21600:  # 6 hour cache
         return _news_cache["data"]
-    from datetime import date
+
+    cycle = {"stage": "act", "repaired_fields": [], "fallback_fields": [], "errors": []}
     today = date.today().strftime("%d %B %Y")
     prompt = (
         f"Today is {today}. Search the web for the MOST RECENT Indian market news, earnings, "
@@ -1041,10 +1184,11 @@ async def _fetch_news_and_earnings(api_key: str, stock_list: str) -> dict:
         f"Include: 3 earnings, 4 market news, 3 stock news items for {stock_list[:50]}, and all 9 fixed income fields. "
         f"Remember: output ONLY the JSON, with your best recent data filled in — no apology text, no caveats."
     )
+
+    result = {"earnings": [], "market_news": [], "portfolio_news": [], "fixed_income": {}}
     try:
         async with httpx.AsyncClient(timeout=120.0) as client:
-            # Step 1: Call with web_search tool — Claude will search and return tool results
-            # Retry once on rate limit (429) after a short backoff
+            # ── ACT: step 1 — call with web_search, retry once on rate limit ──
             resp1 = None
             for attempt in range(2):
                 resp1 = await client.post(
@@ -1061,31 +1205,26 @@ async def _fetch_news_and_earnings(api_key: str, stock_list: str) -> dict:
                         "messages": [{"role": "user", "content": prompt}]
                     })
                 if resp1.status_code == 429 and attempt == 0:
-                    log.warning("News fetch hit rate limit, retrying in 15s...")
-                    import asyncio as _aio
-                    await _aio.sleep(15)
+                    log.warning("Agent: rate limited, retrying in 15s...")
+                    cycle["errors"].append("rate_limited_retry")
+                    await asyncio.sleep(15)
                     continue
                 break
+
             if resp1.status_code != 200:
-                log.warning(f"News fetch step1 HTTP {resp1.status_code}: {resp1.text[:200]}")
-                return {"earnings": [], "market_news": [], "portfolio_news": [], "fixed_income": {}}
+                cycle["errors"].append(f"step1_http_{resp1.status_code}")
+                log.warning(f"Agent step1 HTTP {resp1.status_code}: {resp1.text[:200]}")
+                _agent_log({**cycle, "stage": "failed", "success": False})
+                return result
 
             resp1_data = resp1.json()
             assistant_content = resp1_data.get("content", [])
 
-            # If stop_reason is tool_use, we need to send tool results back
             if resp1_data.get("stop_reason") == "tool_use":
-                # Build tool results from web_search_tool_result blocks
-                tool_results = []
-                for block in assistant_content:
-                    if block.get("type") == "web_search_tool_result":
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": block.get("tool_use_id"),
-                            "content": block.get("content", [])
-                        })
-
-                # Step 2: Send tool results back to get final text response
+                tool_results = [
+                    {"type": "tool_result", "tool_use_id": b.get("tool_use_id"), "content": b.get("content", [])}
+                    for b in assistant_content if b.get("type") == "web_search_tool_result"
+                ]
                 resp2 = await client.post(
                     "https://api.anthropic.com/v1/messages",
                     headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
@@ -1101,30 +1240,71 @@ async def _fetch_news_and_earnings(api_key: str, stock_list: str) -> dict:
                              [{"type": "text", "text": "Based on the search results above, provide the JSON."}]}
                         ]
                     })
-                if resp2.status_code == 200:
-                    final_blocks = resp2.json().get("content", [])
-                else:
-                    final_blocks = assistant_content
+                final_blocks = resp2.json().get("content", []) if resp2.status_code == 200 else assistant_content
             else:
                 final_blocks = assistant_content
 
-            # Extract text from final response
             text = " ".join(b.get("text", "") for b in final_blocks if b.get("type") == "text").strip()
             text = re.sub(r"```[^\n]*\n?|```", "", text).strip()
-            start = text.find("{")
-            end   = text.rfind("}") + 1
+            start, end = text.find("{"), text.rfind("}") + 1
             if start >= 0 and end > start:
-                result = _j.loads(text[start:end])
-                _news_cache["data"] = result
-                _news_cache["ts"]   = time.time()
-                log.info(f"News fetch OK: {len(result.get('market_news',[]))} news, "
-                         f"{len(result.get('earnings',[]))} earnings, "
-                         f"fixed_income keys: {list(result.get('fixed_income',{}).keys())}")
-                return result
-            log.warning(f"News fetch: no JSON found in response. Text: {text[:300]}")
+                result = json.loads(text[start:end])
+            else:
+                cycle["errors"].append("no_json_in_response")
+                log.warning(f"Agent: no JSON found. Text: {text[:300]}")
+
+            # ── VERIFY ──
+            cycle["stage"] = "verify"
+            verdict = _agent_verify(result)
+            cycle["issues"] = verdict["issues"]
+
+            # ── REPAIR — one targeted follow-up for missing/implausible fields ──
+            if verdict["missing_fixed_income"]:
+                cycle["stage"] = "repair"
+                log.info(f"Agent: repairing {verdict['missing_fixed_income']}")
+                repaired = await _agent_repair(api_key, verdict["missing_fixed_income"])
+                if repaired:
+                    fi = result.setdefault("fixed_income", {})
+                    for k, v in repaired.items():
+                        if v is not None and k in verdict["missing_fixed_income"]:
+                            fi[k] = v
+                            cycle["repaired_fields"].append(k)
+
+            # ── Final fallback — only for fields STILL missing after repair ──
+            verdict2 = _agent_verify(result)
+            if verdict2["missing_fixed_income"]:
+                fi = result.setdefault("fixed_income", {})
+                for k in verdict2["missing_fixed_income"]:
+                    if k in FIXED_INCOME_FALLBACKS and fi.get(k) is None:
+                        fi[k] = FIXED_INCOME_FALLBACKS[k]
+                        cycle["fallback_fields"].append(k)
+                fi["_estimated_fields"] = cycle["fallback_fields"]  # client can show this if needed
+
+            cycle["success"] = True
+            cycle["news_count"] = len(result.get("market_news", []))
+            cycle["earnings_count"] = len(result.get("earnings", []))
+            _agent_log(cycle)
+
+            _news_cache["data"] = result
+            _news_cache["ts"] = time.time()
+            log.info(f"Agent OK: {cycle['news_count']} news, {cycle['earnings_count']} earnings, "
+                     f"repaired={cycle['repaired_fields']}, fallback={cycle['fallback_fields']}")
+            return result
+
     except Exception as e:
-        log.warning(f"News fetch failed: {e}")
-    return {"earnings": [], "market_news": [], "portfolio_news": [], "fixed_income": {}}
+        cycle["errors"].append(str(e)[:150])
+        cycle["success"] = False
+        _agent_log(cycle)
+        log.warning(f"Agent fetch failed: {e}")
+    return result
+
+@app.get("/agent-health")
+async def agent_health():
+    """Visible health log — last N fetch cycles with what happened at each stage."""
+    return {
+        "cycles_logged": len(_agent_health),
+        "history": _agent_health,
+    }
 
 @app.get("/debug-news-raw")
 async def debug_news_raw():
