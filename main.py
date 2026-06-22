@@ -285,6 +285,185 @@ async def _run_amc_upload_agent(amc_name: str, parsed_funds: dict, api_key: str 
              f"{report['total_repaired']} repaired via AI, {repairs_done} repair calls used")
     return report
 
+# ════════════════════════════════════════════════════════════════
+# CAS IMPORT AGENT -- Pass 3: AI-assisted fund resolution
+#
+# Pass 1 (client-side exact/significant-word match against local
+# factsheets) and Pass 2 (server /search with a 0.4 score threshold)
+# already run client-side before this is ever called. This endpoint
+# is Pass 3 -- the AI repair step for funds that survived both and
+# are still unmatched, due to genuine name variation (AMC renamed a
+# fund, merged schemes, abbreviation the local rules don't cover,
+# OCR noise from a scanned CAS PDF, etc).
+#
+# Resolution is cached permanently by the exact CAS-stated fund name
+# string, so the same fund name is never billed for AI resolution
+# twice across any client's CAS import.
+# ════════════════════════════════════════════════════════════════
+
+CAS_RESOLVE_CACHE_FILE = DATA_DIR / "cas_resolve_cache.json"
+_cas_resolve_cache: dict = {}
+
+def _load_cas_resolve_cache():
+    global _cas_resolve_cache
+    try:
+        if CAS_RESOLVE_CACHE_FILE.exists():
+            _cas_resolve_cache = json.loads(CAS_RESOLVE_CACHE_FILE.read_text())
+            log.info(f"CAS resolve cache loaded: {len(_cas_resolve_cache)} entries")
+    except Exception as e:
+        log.warning(f"CAS resolve cache load failed: {e}")
+
+def _save_cas_resolve_cache():
+    try:
+        CAS_RESOLVE_CACHE_FILE.write_text(json.dumps(_cas_resolve_cache, ensure_ascii=False))
+    except Exception as e:
+        log.warning(f"CAS resolve cache save failed: {e}")
+
+_load_cas_resolve_cache()
+
+async def _agent_resolve_fund_name(api_key: str, cas_name: str, candidates: list) -> dict:
+    """Ask Claude to decide whether one of the candidate funds (from /search)
+    is actually the fund named in the CAS statement, accounting for AMC
+    renames, abbreviations, OCR noise, and merged schemes. If none of the
+    candidates are a real match, ask it to identify the fund directly via
+    web search and return its current correct name for a follow-up search.
+
+    Returns: {"action": "matched", "key": "...", "name": "...", "confidence": "high|medium"}
+          or {"action": "rename_suggestion", "suggested_name": "...", "confidence": "..."}
+          or {"action": "unresolved", "reason": "..."}
+    """
+    cache_key = norm(cas_name)
+    if cache_key in _cas_resolve_cache:
+        return _cas_resolve_cache[cache_key]
+
+    if not api_key:
+        return {"action": "unresolved", "reason": "no_api_key"}
+
+    candidates_text = "\n".join(
+        f'{i+1}. "{c["name"]}" (AMC: {c["amc"]}, search score: {c["score"]})'
+        for i, c in enumerate(candidates[:10])
+    ) or "(no candidates found in local database)"
+
+    prompt = (
+        f'A client\'s CAS (Consolidated Account Statement) lists a mutual fund holding as:\n'
+        f'"{cas_name}"\n\n'
+        f'Our database has these candidate funds that scored too low to auto-match '
+        f'(threshold not met):\n{candidates_text}\n\n'
+        f'Indian mutual fund names vary due to AMC mergers, scheme renames, plan/option '
+        f'abbreviations, and CAS formatting differences. Decide:\n'
+        f'1. Is the CAS name actually one of the candidates above, just named differently? '
+        f'If yes, which one (give its exact number)?\n'
+        f'2. If NONE of the candidates are a real match, search the web to identify what '
+        f'fund "{cas_name}" actually refers to (check for AMC renames/mergers -- e.g. a '
+        f'fund house may have changed its name or merged with another).\n\n'
+        f'Return ONLY JSON, no other text:\n'
+        f'{{"action":"matched","candidate_number":1,"confidence":"high"}} OR\n'
+        f'{{"action":"rename_suggestion","suggested_name":"actual current fund name to search for","confidence":"medium"}} OR\n'
+        f'{{"action":"unresolved","reason":"brief reason"}}'
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
+                         "content-type": "application/json"},
+                json={
+                    "model": "claude-haiku-4-5-20251001",
+                    "max_tokens": 300,
+                    "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 2}],
+                    "messages": [{"role": "user", "content": prompt}]
+                })
+            if resp.status_code != 200:
+                log.warning(f"CAS resolve HTTP {resp.status_code} for '{cas_name}'")
+                return {"action": "unresolved", "reason": f"api_error_{resp.status_code}"}
+            data = resp.json()
+            blocks = data.get("content", [])
+            if data.get("stop_reason") == "tool_use":
+                tool_results = [
+                    {"type": "tool_result", "tool_use_id": b.get("tool_use_id"), "content": b.get("content", [])}
+                    for b in blocks if b.get("type") == "web_search_tool_result"
+                ]
+                resp2 = await client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
+                             "content-type": "application/json"},
+                    json={
+                        "model": "claude-haiku-4-5-20251001",
+                        "max_tokens": 250,
+                        "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 2}],
+                        "messages": [
+                            {"role": "user", "content": prompt},
+                            {"role": "assistant", "content": blocks},
+                            {"role": "user", "content": tool_results if tool_results else
+                             [{"type": "text", "text": "Provide the JSON decision now."}]}
+                        ]
+                    })
+                blocks = resp2.json().get("content", []) if resp2.status_code == 200 else blocks
+            text = " ".join(b.get("text", "") for b in blocks if b.get("type") == "text").strip()
+            text = re.sub(r"```[^\n]*\n?|```", "", text).strip()
+            start, end = text.find("{"), text.rfind("}") + 1
+            if start < 0 or end <= start:
+                return {"action": "unresolved", "reason": "no_json_in_response"}
+            decision = json.loads(text[start:end])
+
+            result = {"action": "unresolved", "reason": "unknown"}
+            if decision.get("action") == "matched":
+                idx = decision.get("candidate_number", 0) - 1
+                if 0 <= idx < len(candidates[:10]):
+                    c = candidates[idx]
+                    result = {"action": "matched", "key": c["key"], "name": c["name"],
+                              "amc": c["amc"], "confidence": decision.get("confidence", "medium")}
+            elif decision.get("action") == "rename_suggestion":
+                result = {"action": "rename_suggestion",
+                          "suggested_name": decision.get("suggested_name", ""),
+                          "confidence": decision.get("confidence", "low")}
+            else:
+                result = {"action": "unresolved", "reason": decision.get("reason", "ai_could_not_determine")}
+
+            _cas_resolve_cache[cache_key] = result
+            _save_cas_resolve_cache()
+            log.info(f"CAS agent resolved '{cas_name}' -> {result['action']}")
+            return result
+    except Exception as e:
+        log.warning(f"CAS resolve failed for '{cas_name}': {e}")
+        return {"action": "unresolved", "reason": str(e)[:100]}
+
+@app.post("/cas-resolve")
+async def cas_resolve(payload: dict):
+    """CAS Import Agent Pass 3 -- given a list of fund names that Pass 1
+    (local) and Pass 2 (server /search threshold) both failed to match,
+    use AI to make a final judgment call per fund. Designed to be called
+    once per CAS import with the batch of still-unmatched funds.
+
+    Request body: {"unmatched": ["fund name 1", "fund name 2", ...]}
+    Response: {"resolutions": {"fund name 1": {...}, ...}}
+    """
+    unmatched = payload.get("unmatched", [])
+    if not unmatched:
+        return {"resolutions": {}}
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    resolutions = {}
+    MAX_PER_CALL = 10  # bound cost per CAS import
+
+    for cas_name in unmatched[:MAX_PER_CALL]:
+        qn = norm(cas_name)
+        qw = set(qn.split())
+        candidates = []
+        for k, v in holdings_db.items():
+            kw = set(k.split())
+            s = len(qw & kw) / max(min(len(qw), len(kw)), 1)
+            if qn in k: s += 0.6
+            if k in qn: s += 0.4
+            if s > 0:
+                candidates.append({"score": round(s, 2), "name": v["fund_name"],
+                                    "amc": v["amc"], "key": k})
+        candidates.sort(key=lambda x: -x["score"])
+
+        resolutions[cas_name] = await _agent_resolve_fund_name(api_key, cas_name, candidates)
+
+    return {"resolutions": resolutions, "cache_size": len(_cas_resolve_cache)}
+
 @app.get("/amc-health")
 async def amc_health():
     """Visible health log -- last N AMC upload cycles with per-fund verify/repair detail."""
