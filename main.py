@@ -1565,10 +1565,17 @@ async def _fetch_news_and_earnings(api_key: str, stock_list: str) -> dict:
         f"most recent real figures you found, even if approximate or slightly dated. Only use null if "
         f"you genuinely found nothing after searching — but try all 7 searches above before giving up "
         f"on any field.\n\n"
+        f"For beat_miss: use \"Miss\" whenever revenue_growth_pct OR profit_growth_pct is "
+        f"NEGATIVE (an actual year-over-year decline), even if the company technically beat a "
+        f"lowered analyst estimate. Do not label a real earnings decline as \"Beat\" or "
+        f"\"In-line\" just because it cleared a reduced forecast — the advisor needs to see the "
+        f"real decline. Use \"Beat\" only for genuine positive YoY growth that exceeded "
+        f"expectations, \"In-line\" for flat/as-expected results, \"Miss\" for any negative "
+        f"YoY decline or a result below expectations.\n\n"
         "Return ONLY the JSON object, no other text:\n"
-        '{"earnings":[{"company":"","result_date":"","revenue_growth_pct":0,"profit_growth_pct":0,"beat_miss":"Beat"}],'
-        '"market_news":[{"headline":"","category":"Market","sentiment":"Positive"}],'
-        '"portfolio_news":[{"stock":"","headline":"","sentiment":"Positive"}],'
+        '{"earnings":[{"company":"","result_date":"","revenue_growth_pct":0,"profit_growth_pct":0,"beat_miss":"Beat|In-line|Miss"}],'
+        '"market_news":[{"headline":"","category":"Market","sentiment":"Positive|Neutral|Negative"}],'
+        '"portfolio_news":[{"stock":"","headline":"","sentiment":"Positive|Neutral|Negative"}],'
         '"fixed_income":{"gsec_10y":0.0,"gsec_5y":0.0,"gsec_1y":0.0,"repo_rate":0.0,"rbi_stance":"","cpi_inflation":0.0,"aaa_spread_10y":0,"mibor_overnight":0.0,"yield_curve_slope":0,"debt_market_view":""}}\n\n'
         f"Include: 3 earnings, 4 market news, 3 stock news items for {stock_list[:50]}, and all 9 fixed income fields. "
         f"Remember: output ONLY the JSON, with your best recent data filled in — no apology text, no caveats."
