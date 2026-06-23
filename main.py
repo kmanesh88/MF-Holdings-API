@@ -247,11 +247,118 @@ async def _agent_repair_cap(api_key: str, stock_name: str, isin: str = "") -> Op
         log.warning(f"Cap repair failed for '{stock_name}': {e}")
     return None
 
-async def _run_amc_upload_agent(amc_name: str, parsed_funds: dict, api_key: str = ""):
+def _amc_rename_candidates(amc_name: str, new_key: str, new_fund_name: str) -> list:
+    """Find existing holdings_db entries for the SAME AMC whose normalized
+    key is suspiciously similar to a brand-new key, but not identical --
+    the signature of an AMC renaming a scheme between monthly disclosures
+    (e.g. dropping/adding a word, changing 'Fund' to 'Scheme', etc).
+    Pure local heuristic, no AI cost for this screening step."""
+    candidates = []
+    new_words = set(w for w in new_key.split() if len(w) >= 3)
+    if not new_words:
+        return candidates
+    for existing_key, existing_data in holdings_db.items():
+        if existing_key == new_key:
+            continue  # exact match -- not a rename, handled by normal overwrite
+        if existing_data.get("amc", "").strip().lower() != amc_name.strip().lower():
+            continue  # only consider renames within the same AMC
+        existing_words = set(w for w in existing_key.split() if len(w) >= 3)
+        if not existing_words:
+            continue
+        overlap = len(new_words & existing_words)
+        union_size = len(new_words | existing_words)
+        similarity = overlap / union_size if union_size else 0
+        # High overlap (most words shared) but not identical -- rename signature
+        if similarity >= 0.55:
+            candidates.append({
+                "key": existing_key,
+                "fund_name": existing_data.get("fund_name", existing_key),
+                "similarity": round(similarity, 2),
+            })
+    candidates.sort(key=lambda c: -c["similarity"])
+    return candidates[:3]  # at most 3 candidates worth asking AI about
+
+async def _agent_confirm_rename(api_key: str, amc_name: str, new_name: str, old_name: str) -> bool:
+    """AI judgment call -- is `new_name` actually the same scheme as
+    `old_name`, just renamed by the AMC, or are these genuinely two
+    different funds that happen to share similar words? Cached by the
+    (old,new) pair so the same rename decision is never billed twice."""
+    cache_key = f"{norm(old_name)}|||{norm(new_name)}"
+    if cache_key in _cas_resolve_cache:
+        cached = _cas_resolve_cache[cache_key]
+        return cached.get("is_rename", False)
+
+    if not api_key:
+        return False  # no AI available -- do not guess, leave both entries as-is
+
+    prompt = (
+        f'AMC "{amc_name}" has an existing fund in our database called '
+        f'"{old_name}". A new monthly disclosure upload contains a fund called '
+        f'"{new_name}" that was not in our database before.\n\n'
+        f'Is "{new_name}" actually the SAME scheme as "{old_name}", just renamed '
+        f'by the AMC (e.g. SEBI-mandated rename, AMC merger, scheme repositioning)? '
+        f'Or are these genuinely two different, separate funds?\n\n'
+        f'If you are not highly confident it is a rename of the same scheme, answer NO -- '
+        f'it is safer to treat them as different funds than to wrongly merge two distinct schemes.\n\n'
+        f'Return ONLY one word: "YES" or "NO".'
+    )
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
+                         "content-type": "application/json"},
+                json={
+                    "model": "claude-haiku-4-5-20251001",
+                    "max_tokens": 10,
+                    "messages": [{"role": "user", "content": prompt}]
+                })
+            if resp.status_code != 200:
+                return False
+            text = resp.json().get("content", [{}])[0].get("text", "").strip().upper()
+            is_rename = text.startswith("YES")
+            _cas_resolve_cache[cache_key] = {"is_rename": is_rename, "checked_at": time.time()}
+            _save_cas_resolve_cache()
+            return is_rename
+    except Exception as e:
+        log.warning(f"Rename confirmation failed for '{new_name}' vs '{old_name}': {e}")
+        return False
+
+async def _detect_and_resolve_renames(amc_name: str, parsed: dict, api_key: str) -> dict:
+    """Runs BEFORE holdings_db.update() -- for every brand-new fund key in
+    this upload, check if it's likely a rename of an existing fund for the
+    same AMC. If AI confirms with high confidence, delete the OLD key so
+    the new one cleanly replaces it instead of sitting alongside as a
+    silent duplicate. Fully automatic -- no manual decision required.
+    Returns a log of what was auto-merged, for visibility in /amc-health.
+    """
+    renames_resolved = []
+    for new_key, fund_data in parsed.items():
+        if new_key in holdings_db:
+            continue  # exact key match -- normal overwrite, not a rename case
+        candidates = _amc_rename_candidates(amc_name, new_key, fund_data.get("fund_name", new_key))
+        for cand in candidates:
+            confirmed = await _agent_confirm_rename(
+                api_key, amc_name, fund_data.get("fund_name", new_key), cand["fund_name"]
+            )
+            if confirmed:
+                del holdings_db[cand["key"]]
+                renames_resolved.append({
+                    "old_name": cand["fund_name"], "old_key": cand["key"],
+                    "new_name": fund_data.get("fund_name", new_key), "new_key": new_key,
+                    "similarity": cand["similarity"],
+                })
+                log.info(f"Rename auto-resolved: '{cand['fund_name']}' -> "
+                         f"'{fund_data.get('fund_name', new_key)}'")
+                break  # only merge into the single best candidate
+    return {"renames_resolved": renames_resolved}
+
+async def _run_amc_upload_agent(amc_name: str, parsed_funds: dict, api_key: str = "", rename_report: dict = None):
     """Full agent cycle for one AMC upload -- verify every fund's enriched
     holdings, repair genuinely unresolved stocks (capped per upload to keep
     cost bounded), and log a per-AMC health report."""
-    report = {"amc": amc_name, "funds": [], "total_unresolved": 0, "total_repaired": 0}
+    report = {"amc": amc_name, "funds": [], "total_unresolved": 0, "total_repaired": 0,
+               "renames_resolved": (rename_report or {}).get("renames_resolved", [])}
     MAX_REPAIRS_PER_UPLOAD = 15
     repairs_done = 0
 
@@ -1125,12 +1232,21 @@ async def upload(
     check_secret(secret)
     total_funds = 0; fund_names = []
     all_parsed = {}
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    all_renames_resolved = []
+
     for f in files:
         fname = f.filename or "upload"
         if not re.search(r'\.(xlsx|xls|zip)$', fname, re.I): continue
         raw    = await f.read()
         parsed = process_upload(raw, fname, amc.strip())
         if parsed:
+            # Rename detection MUST run before holdings_db.update() -- once
+            # the new key is written, we can no longer tell "new fund" apart
+            # from "fund that already existed under this exact name".
+            rename_result = await _detect_and_resolve_renames(amc.strip(), parsed, api_key)
+            all_renames_resolved.extend(rename_result["renames_resolved"])
+
             holdings_db.update(parsed)
             all_parsed.update(parsed)
             total_funds += len(parsed)
@@ -1144,9 +1260,11 @@ async def upload(
     # Fire the verify/repair agent in the background — doesn't block the
     # upload response, but runs immediately so /amc-health reflects this
     # upload within a few seconds rather than requiring a manual trigger.
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if all_parsed:
-        asyncio.create_task(_run_amc_upload_agent(amc.strip(), all_parsed, api_key))
+        asyncio.create_task(_run_amc_upload_agent(
+            amc.strip(), all_parsed, api_key,
+            rename_report={"renames_resolved": all_renames_resolved}
+        ))
 
     return {"status": "ok", "amc": amc, "files": len(files),
             "funds_added": total_funds, "funds_total": len(holdings_db),
