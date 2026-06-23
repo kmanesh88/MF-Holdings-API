@@ -1222,6 +1222,87 @@ async def search(q: str = Query(..., min_length=2)):
     res.sort(key=lambda x: -x["score"])
     return {"query": q, "results": res[:15]}
 
+@app.post("/upload-parsed")
+async def upload_parsed(payload: dict):
+    """Accept ALREADY-PARSED fund data (JSON) directly -- used by the
+    client-side PDF.js factsheet parser for AMCs that only publish PDF
+    disclosures (no Excel/ZIP available, e.g. Sundaram). Re-parsing a PDF
+    server-side would duplicate work the client already did and risk
+    inconsistent results between two separate parsers -- this endpoint
+    instead trusts the client's PDF.js extraction and runs it through the
+    EXACT SAME pipeline as Excel uploads: rename detection, holdings_db
+    write, and the verify/repair Upload Agent.
+
+    Expected payload shape:
+    {
+      "amc": "Sundaram Mutual Fund",
+      "secret": "...",
+      "funds": {
+        "<normalized_key>": {
+          "fund_name": "Sundaram Mid Cap Fund",
+          "amc": "Sundaram Mutual Fund",
+          "holdings": [{"name":"...","isin":"...","sector":"...","pct":1.23}, ...],
+          "count": 47,
+          "cashPct": 2.1
+        }, ...
+      }
+    }
+    """
+    check_secret(payload.get("secret", ""))
+    amc_name = (payload.get("amc") or "").strip()
+    funds = payload.get("funds") or {}
+    if not amc_name:
+        raise HTTPException(422, "amc name is required")
+    if not funds:
+        raise HTTPException(422, "No fund data provided")
+
+    # Validate and normalize each fund entry to the exact shape the rest
+    # of the pipeline expects -- reject anything malformed rather than
+    # silently accepting bad data into holdings_db
+    parsed = {}
+    for key, fund in funds.items():
+        holdings = fund.get("holdings")
+        if not isinstance(holdings, list) or len(holdings) < 2:
+            continue  # same minimum-holdings bar as the Excel parser
+        clean_holdings = []
+        for h in holdings:
+            if not isinstance(h, dict) or not h.get("name"):
+                continue
+            clean_holdings.append({
+                "name":   str(h.get("name", "")).strip(),
+                "isin":   str(h.get("isin", "")).strip(),
+                "sector": str(h.get("sector", "")).strip(),
+                "pct":    round(float(h.get("pct", 0) or 0), 4),
+            })
+        if len(clean_holdings) < 2:
+            continue
+        norm_key = norm(fund.get("fund_name", key))
+        parsed[norm_key] = {
+            "fund_name": str(fund.get("fund_name", key)).strip(),
+            "amc": amc_name,
+            "holdings": clean_holdings,
+            "count": len(clean_holdings),
+            "cashPct": round(float(fund.get("cashPct", 0) or 0), 4),
+        }
+
+    if not parsed:
+        raise HTTPException(422, "No valid fund data after validation — check holdings format")
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    rename_result = await _detect_and_resolve_renames(amc_name, parsed, api_key)
+
+    holdings_db.update(parsed)
+    save_db()
+
+    asyncio.create_task(_run_amc_upload_agent(
+        amc_name, parsed, api_key,
+        rename_report={"renames_resolved": rename_result["renames_resolved"]}
+    ))
+
+    return {"status": "ok", "amc": amc_name, "source": "pdf_client_parsed",
+            "funds_added": len(parsed), "funds_total": len(holdings_db),
+            "renames_resolved": len(rename_result["renames_resolved"])}
+
 @app.post("/upload")
 async def upload(
     files:  List[UploadFile] = File(...),
