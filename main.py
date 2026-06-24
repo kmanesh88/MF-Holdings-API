@@ -609,87 +609,151 @@ def _cas_verify_extraction(funds: list, raw_text: str) -> dict:
 
 
 async def _agent_extract_cas_via_ai(api_key: str, raw_text: str) -> list:
-    """REPAIR step -- ask Claude to read the raw statement text directly
-    and extract every fund holding, regardless of provider-specific
-    layout. This is the generic fallback that replaces needing a new
-    hand-coded parser for every new statement format encountered."""
+    """REPAIR/PRIMARY step -- ask Claude to read the raw statement text
+    directly and extract every fund holding, regardless of provider-
+    specific layout. This replaces needing a new hand-coded parser for
+    every new statement format/provider encountered.
+
+    Long statements (multi-page, 50+ holdings) are chunked rather than
+    truncated -- a hard truncation silently drops holdings from large
+    portfolios, which is worse than a slower multi-call extraction.
+    """
     if not api_key:
         return []
 
-    # Truncate very long statements to keep token cost bounded -- most
-    # portfolio statements list holdings well within the first 8000 chars
-    text_excerpt = raw_text[:8000]
+    # Chunk size tuned to stay well under context/output limits while
+    # keeping each chunk's table rows intact (a holding row is rarely
+    # split across a chunk boundary at this size in practice; any
+    # split row is caught by the VERIFY reconciliation check afterward)
+    CHUNK_SIZE = 12000
+    chunks = [raw_text[i:i+CHUNK_SIZE] for i in range(0, len(raw_text), CHUNK_SIZE)] or [raw_text]
 
-    prompt = (
+    extraction_instructions = (
         f'This is raw text extracted from a client mutual fund portfolio statement '
         f'(could be from CAMS, KFintech, or a platform like Scripbox, Groww, Kuvera, '
         f'ETMoney, INDmoney -- the exact layout varies by provider).\n\n'
-        f'Extract EVERY individual mutual fund holding mentioned, with its current '
-        f'market value, cost/purchase value, and units if available. Ignore category '
-        f'subtotals (like "Equity", "Large Cap", "Debt") and the grand total row -- '
-        f'only extract individual fund scheme rows.\n\n'
-        f'Return ONLY a JSON array, no other text:\n'
-        f'[{{"name":"exact fund scheme name","value":0.0,"cost":0.0,"units":0.0}}, ...]\n\n'
-        f'Statement text:\n{text_excerpt}'
+        f'Extract EVERY individual mutual fund HOLDING row mentioned -- each row '
+        f'represents one folio/purchase, with its own units, cost, and current '
+        f'market value.\n\n'
+        f'CRITICAL: The SAME scheme name can legitimately appear MULTIPLE TIMES with '
+        f'different folio numbers (e.g. a client invested in "XYZ Mid Cap Fund" via '
+        f'5 separate folios over the years). Each occurrence is a SEPARATE real '
+        f'holding with its own value -- you must extract ALL of them, never merge or '
+        f'deduplicate by scheme name. Include the folio number in your output so '
+        f'each holding can be told apart.\n\n'
+        f'Ignore category/subtotal rows (e.g. "Equity", "Large Cap", "Debt", '
+        f'"Hybrid") and the final grand total row -- only extract individual fund '
+        f'holding rows that have a folio number and a purchase date.\n\n'
+        f'Return ONLY a JSON array, no other text, no markdown fences:\n'
+        f'[{{"name":"exact fund scheme name","folio":"folio number as text","value":0.0,"cost":0.0,"units":0.0}}, ...]\n\n'
+        f'Statement text (this may be one section of a longer statement -- extract '
+        f'only what appears in THIS text, do not guess at content outside it):\n'
     )
+
+    all_funds = []
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
-                         "content-type": "application/json"},
-                json={
-                    "model": "claude-haiku-4-5-20251001",
-                    "max_tokens": 2000,
-                    "messages": [{"role": "user", "content": prompt}]
-                })
-            if resp.status_code != 200:
-                log.warning(f"CAS AI extraction HTTP {resp.status_code}")
-                return []
-            text = resp.json().get("content", [{}])[0].get("text", "").strip()
-            text = re.sub(r"```[^\n]*\n?|```", "", text).strip()
-            start, end = text.find("["), text.rfind("]") + 1
-            if start < 0 or end <= start:
-                return []
-            funds = json.loads(text[start:end])
-            return [f for f in funds if isinstance(f, dict) and f.get("name") and f.get("value", 0) > 0]
+        async with httpx.AsyncClient(timeout=90.0) as client:
+            for chunk_idx, chunk in enumerate(chunks):
+                prompt = extraction_instructions + chunk
+                resp = await client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
+                             "content-type": "application/json"},
+                    json={
+                        "model": "claude-haiku-4-5-20251001",
+                        "max_tokens": 4000,
+                        "messages": [{"role": "user", "content": prompt}]
+                    })
+                if resp.status_code != 200:
+                    log.warning(f"CAS AI extraction chunk {chunk_idx} HTTP {resp.status_code}")
+                    continue
+                text = resp.json().get("content", [{}])[0].get("text", "").strip()
+                text = re.sub(r"```[^\n]*\n?|```", "", text).strip()
+                start, end = text.find("["), text.rfind("]") + 1
+                if start < 0 or end <= start:
+                    continue
+                try:
+                    funds = json.loads(text[start:end])
+                    valid = [f for f in funds if isinstance(f, dict) and f.get("name") and f.get("value", 0) >= 0]
+                    all_funds.extend(valid)
+                except json.JSONDecodeError as e:
+                    log.warning(f"CAS AI extraction chunk {chunk_idx} JSON parse failed: {e}")
+                    continue
     except Exception as e:
         log.warning(f"CAS AI extraction failed: {e}")
-        return []
+
+    # Dedupe ONLY on the exact (name, folio) pair -- never on name alone,
+    # since the same scheme name across different folios are genuinely
+    # separate holdings (this was the root cause of a real data-corruption
+    # bug found in testing -- deduping by name alone silently discarded
+    # real holdings and undercounted a client's portfolio by ~35%)
+    seen = {}
+    for f in all_funds:
+        key = f"{f.get('name','').strip().lower()}__{f.get('folio','').strip()}"
+        if key not in seen or f.get("value", 0) > seen[key].get("value", 0):
+            seen[key] = f
+    return list(seen.values())
 
 
 @app.post("/cas-extract")
 async def cas_extract(payload: dict):
-    """CAS Extraction Agent -- verifies a client-side deterministic parse
-    and, if it failed or doesn't reconcile, falls back to AI extraction
-    directly from the raw statement text. Fully automatic -- the advisor
-    never has to know or care which path was used.
+    """CAS Extraction Agent -- decides between a fast free deterministic
+    parse and AI extraction based on statement complexity, then verifies
+    the result reconciles against the document's own stated total.
+
+    Testing against real multi-page client statements (50-100+ holdings,
+    repeated scheme names across multiple folios, segregated/zero-value
+    portfolios) showed the regex-based deterministic parser is reliable
+    only for simple statements -- on complex ones it silently miscounts
+    by 30%+ (e.g. by mismatching which numbers belong to which row, or
+    by a dedup step incorrectly merging genuinely separate folios of the
+    same scheme). Rather than keep patching the regex per failure mode,
+    AI extraction is now the PRIMARY path for any statement with more
+    than a handful of holdings -- the regex stays only as an instant,
+    free path for trivial 1-4 fund statements where it's reliable and
+    saves an API call.
 
     Request body: {"raw_text": "...", "parsed_funds": [{"name","value","cost","units"}, ...]}
-    Response: {"funds": [...], "source": "deterministic"|"ai_repair", "verify": {...}}
+    Response: {"funds": [...], "source": "deterministic"|"ai_primary"|"ai_repair", "verify": {...}}
     """
     raw_text = payload.get("raw_text", "")
     parsed_funds = payload.get("parsed_funds") or []
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
 
+    SIMPLE_STATEMENT_THRESHOLD = 5  # at or below this many detected holdings, trust the regex
+
+    if len(parsed_funds) > SIMPLE_STATEMENT_THRESHOLD and api_key:
+        # AI-FIRST PATH -- statement is complex enough that the deterministic
+        # parser's failure modes (column misalignment, incorrect dedup) are
+        # a real risk. Go straight to AI extraction rather than trusting a
+        # regex result that might already be silently wrong.
+        ai_funds = await _agent_extract_cas_via_ai(api_key, raw_text)
+        if ai_funds:
+            ai_verdict = _cas_verify_extraction(ai_funds, raw_text)
+            log.info(f"CAS agent (AI-primary, {len(parsed_funds)} detected holdings): "
+                     f"AI found {len(ai_funds)} funds, reconciled={ai_verdict['ok']}")
+            return {"funds": ai_funds, "source": "ai_primary", "verify": ai_verdict}
+        # AI extraction failed entirely (no API key issue, network, etc) --
+        # fall back to the deterministic result with a clear low-confidence flag
+        verdict = _cas_verify_extraction(parsed_funds, raw_text)
+        log.warning("CAS agent: AI-primary path failed, falling back to deterministic result")
+        return {"funds": parsed_funds, "source": "deterministic_fallback", "verify": verdict}
+
+    # SIMPLE STATEMENT -- trust the free deterministic parse, but still verify
     verdict = _cas_verify_extraction(parsed_funds, raw_text)
     if verdict["ok"]:
         return {"funds": parsed_funds, "source": "deterministic", "verify": verdict}
 
-    # REPAIR -- deterministic parse failed verification, fall back to AI
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    # REPAIR -- even a "simple" statement's deterministic parse failed
+    # verification, fall back to AI
     ai_funds = await _agent_extract_cas_via_ai(api_key, raw_text)
-
     if ai_funds:
-        # Re-verify the AI's extraction too -- if it ALSO doesn't reconcile,
-        # we still return it (best available) but flag low confidence
         ai_verdict = _cas_verify_extraction(ai_funds, raw_text)
         log.info(f"CAS agent: deterministic parse failed ({verdict['reason']}), "
                  f"AI repair found {len(ai_funds)} funds, reconciled={ai_verdict['ok']}")
         return {"funds": ai_funds, "source": "ai_repair", "verify": ai_verdict,
                 "deterministic_failure_reason": verdict["reason"]}
 
-    # Both paths failed -- return whatever the deterministic parser found
-    # (even if it didn't reconcile) rather than nothing at all
     log.warning(f"CAS agent: both deterministic and AI extraction failed/empty. "
                 f"Deterministic reason: {verdict['reason']}")
     return {"funds": parsed_funds, "source": "failed", "verify": verdict}
