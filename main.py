@@ -536,6 +536,165 @@ async def _agent_resolve_fund_name(api_key: str, cas_name: str, candidates: list
         log.warning(f"CAS resolve failed for '{cas_name}': {e}")
         return {"action": "unresolved", "reason": str(e)[:100]}
 
+# ════════════════════════════════════════════════════════════════
+# CAS EXTRACTION AGENT -- Plan, Act, Verify, Repair, Report
+#
+# Mirrors the AMC Upload Agent's shape exactly, applied to client
+# portfolio statements (CAS/CAMS/KFintech/Scripbox/Groww/Kuvera/etc)
+# instead of AMC factsheets:
+#   1. PLAN   -- a correctly parsed statement should yield at least one
+#                fund, with market values that reconcile against any
+#                stated "Total"/"Grand Total" figure in the document
+#   2. ACT    -- the deterministic client-side parser (CAMS-style regex,
+#                Scripbox heuristic, etc) runs FIRST -- free, instant,
+#                zero AI cost, same as Excel-first for AMC uploads
+#   3. VERIFY -- the client sends its raw extracted text + what it
+#                parsed (possibly nothing) to this endpoint; we check:
+#                did it find >=1 fund? Do the values reconcile to within
+#                5% of a detected total figure?
+#   4. REPAIR -- if verification fails (new/unrecognized provider
+#                layout, or totals don't reconcile), ask Claude to read
+#                the raw statement text directly and extract every fund
+#                holding, regardless of the provider's specific format.
+#                This REPLACES hand-coding a new regex per provider --
+#                any new statement layout (Groww, Kuvera, ETMoney,
+#                INDmoney, a future CAMS template change) is handled by
+#                the same repair path without needing new code.
+#   5. REPORT -- which path was used (deterministic vs AI-repaired),
+#                surfaced in the import preview so the advisor always
+#                knows when AI extraction was needed.
+# ════════════════════════════════════════════════════════════════
+
+def _cas_verify_extraction(funds: list, raw_text: str) -> dict:
+    """VERIFY step -- did the deterministic parse actually work?"""
+    if not funds:
+        return {"ok": False, "reason": "no_funds_found"}
+
+    total_extracted = sum(f.get("value", 0) for f in funds)
+    if total_extracted <= 0:
+        return {"ok": False, "reason": "zero_total_value"}
+
+    # Look for a stated total in the document text to reconcile against
+    # (handles "Grand Total", "Total Portfolio Value", "Total Value" etc,
+    # common across CAMS, KFintech, and platform-specific statements)
+    total_patterns = [
+        r'grand\s*total[^\d]{0,30}?([\d,]{4,}\.?\d*)',
+        r'total\s*portfolio\s*value[^\d]{0,30}?([\d,]{4,}\.?\d*)',
+        r'total\s*value[^\d]{0,30}?([\d,]{4,}\.?\d*)',
+        r'total\s*current\s*value[^\d]{0,30}?([\d,]{4,}\.?\d*)',
+    ]
+    stated_total = None
+    for pat in total_patterns:
+        m = re.search(pat, raw_text, re.I)
+        if m:
+            try:
+                v = float(m.group(1).replace(",", ""))
+                if v > 0:
+                    stated_total = v
+                    break
+            except ValueError:
+                continue
+
+    if stated_total is None:
+        # No stated total found to check against -- accept the parse as
+        # long as it found at least one fund with a real value (can't
+        # verify reconciliation, but no evidence of failure either)
+        return {"ok": True, "reason": "no_total_to_check", "extracted_total": total_extracted}
+
+    diff_pct = abs(total_extracted - stated_total) / stated_total * 100
+    if diff_pct <= 5:
+        return {"ok": True, "reason": "reconciled", "extracted_total": total_extracted, "stated_total": stated_total}
+    return {"ok": False, "reason": "totals_mismatch", "extracted_total": total_extracted,
+            "stated_total": stated_total, "diff_pct": round(diff_pct, 1)}
+
+
+async def _agent_extract_cas_via_ai(api_key: str, raw_text: str) -> list:
+    """REPAIR step -- ask Claude to read the raw statement text directly
+    and extract every fund holding, regardless of provider-specific
+    layout. This is the generic fallback that replaces needing a new
+    hand-coded parser for every new statement format encountered."""
+    if not api_key:
+        return []
+
+    # Truncate very long statements to keep token cost bounded -- most
+    # portfolio statements list holdings well within the first 8000 chars
+    text_excerpt = raw_text[:8000]
+
+    prompt = (
+        f'This is raw text extracted from a client mutual fund portfolio statement '
+        f'(could be from CAMS, KFintech, or a platform like Scripbox, Groww, Kuvera, '
+        f'ETMoney, INDmoney -- the exact layout varies by provider).\n\n'
+        f'Extract EVERY individual mutual fund holding mentioned, with its current '
+        f'market value, cost/purchase value, and units if available. Ignore category '
+        f'subtotals (like "Equity", "Large Cap", "Debt") and the grand total row -- '
+        f'only extract individual fund scheme rows.\n\n'
+        f'Return ONLY a JSON array, no other text:\n'
+        f'[{{"name":"exact fund scheme name","value":0.0,"cost":0.0,"units":0.0}}, ...]\n\n'
+        f'Statement text:\n{text_excerpt}'
+    )
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
+                         "content-type": "application/json"},
+                json={
+                    "model": "claude-haiku-4-5-20251001",
+                    "max_tokens": 2000,
+                    "messages": [{"role": "user", "content": prompt}]
+                })
+            if resp.status_code != 200:
+                log.warning(f"CAS AI extraction HTTP {resp.status_code}")
+                return []
+            text = resp.json().get("content", [{}])[0].get("text", "").strip()
+            text = re.sub(r"```[^\n]*\n?|```", "", text).strip()
+            start, end = text.find("["), text.rfind("]") + 1
+            if start < 0 or end <= start:
+                return []
+            funds = json.loads(text[start:end])
+            return [f for f in funds if isinstance(f, dict) and f.get("name") and f.get("value", 0) > 0]
+    except Exception as e:
+        log.warning(f"CAS AI extraction failed: {e}")
+        return []
+
+
+@app.post("/cas-extract")
+async def cas_extract(payload: dict):
+    """CAS Extraction Agent -- verifies a client-side deterministic parse
+    and, if it failed or doesn't reconcile, falls back to AI extraction
+    directly from the raw statement text. Fully automatic -- the advisor
+    never has to know or care which path was used.
+
+    Request body: {"raw_text": "...", "parsed_funds": [{"name","value","cost","units"}, ...]}
+    Response: {"funds": [...], "source": "deterministic"|"ai_repair", "verify": {...}}
+    """
+    raw_text = payload.get("raw_text", "")
+    parsed_funds = payload.get("parsed_funds") or []
+
+    verdict = _cas_verify_extraction(parsed_funds, raw_text)
+    if verdict["ok"]:
+        return {"funds": parsed_funds, "source": "deterministic", "verify": verdict}
+
+    # REPAIR -- deterministic parse failed verification, fall back to AI
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    ai_funds = await _agent_extract_cas_via_ai(api_key, raw_text)
+
+    if ai_funds:
+        # Re-verify the AI's extraction too -- if it ALSO doesn't reconcile,
+        # we still return it (best available) but flag low confidence
+        ai_verdict = _cas_verify_extraction(ai_funds, raw_text)
+        log.info(f"CAS agent: deterministic parse failed ({verdict['reason']}), "
+                 f"AI repair found {len(ai_funds)} funds, reconciled={ai_verdict['ok']}")
+        return {"funds": ai_funds, "source": "ai_repair", "verify": ai_verdict,
+                "deterministic_failure_reason": verdict["reason"]}
+
+    # Both paths failed -- return whatever the deterministic parser found
+    # (even if it didn't reconcile) rather than nothing at all
+    log.warning(f"CAS agent: both deterministic and AI extraction failed/empty. "
+                f"Deterministic reason: {verdict['reason']}")
+    return {"funds": parsed_funds, "source": "failed", "verify": verdict}
+
+
 @app.post("/cas-resolve")
 async def cas_resolve(payload: dict):
     """CAS Import Agent Pass 3 -- given a list of fund names that Pass 1
