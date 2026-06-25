@@ -1255,8 +1255,34 @@ def parse_sheet_universal(rows: list, fund_name: str = "") -> tuple:
         if not name_val or len(name_val) < 2: continue
         if SKIP_ROW.match(name_val): continue
 
-        # Strip UTI-style prefixes: "EQ - ", "DB - " etc.
-        name_val = re.sub(r'^(EQ|DB|NCD|CP|TB|GB|MF|CB)\s*[-\u2013]\s*', '', name_val).strip()
+        # UTI-style prefixes ("NCD - ", "CD - ", "CP - ", "TB - " etc.) are a
+        # strong, unambiguous debt-instrument signal -- NCD/CD/CP/TB/GB/DB are
+        # never equity. Previously this prefix was stripped from the name
+        # and silently discarded, leaving classification with no sector
+        # text to go on and defaulting every such holding to "equity" --
+        # a real bug that affected UTI-format debt funds (Low Duration,
+        # Liquid, etc) where most/all holdings carry one of these prefixes.
+        # Fix: capture the prefix's debt category into a synthetic sector
+        # tag BEFORE stripping it from the display name, so the existing
+        # DEBT_SECTOR_RE classification downstream has something to match.
+        _prefix_m = re.match(r'^(EQ|DB|NCD|CP|TB|GB|MF|CB|CD|SPN/DDB|SPN|DDB|PTC|ZCB)\s*[-\u2013]\s*', name_val)
+        prefix_debt_tag = ''
+        if _prefix_m:
+            _ptag = _prefix_m.group(1).upper()
+            if _ptag != 'EQ':  # EQ explicitly means equity -- everything else here is debt
+                prefix_debt_tag = {
+                    'NCD': 'NCD', 'CP': 'Commercial Paper', 'TB': 'T-Bill',
+                    'GB': 'G-Sec', 'DB': 'Debenture', 'CB': 'Bond', 'MF': 'MF',
+                    'CD': 'Certificate of Deposit', 'SPN/DDB': 'Debt',
+                    'SPN': 'Debt', 'DDB': 'Debt', 'PTC': 'Debt', 'ZCB': 'Debt',
+                }.get(_ptag, _ptag)
+        name_val = re.sub(r'^(EQ|DB|NCD|CP|TB|GB|MF|CB|CD|SPN/DDB|SPN|DDB|PTC|ZCB)\s*[-\u2013]\s*', '', name_val).strip()
+        # Also catch debt-instrument signatures embedded in the name without
+        # a clean "PREFIX - " pattern (e.g. "182 DAYS T-BILL - 30/04/2026",
+        # "CD - KOTAK..." already caught above, but bare "T-BILL"/"CD"/"CP"
+        # tokens elsewhere in the name are an equally strong signal)
+        if not prefix_debt_tag and re.search(r'\bt-?bill\b|\bcertificate of deposit\b|\bcommercial paper\b|\bncd\b|\bdebenture\b|\bcorporate debt\b|\bdebt market\b|\bsecuritisation\b|\bsecuritization\b|\bptc\b', name_val, re.I):
+            prefix_debt_tag = 'Debt'
 
         raw_pct = vals.get(pct_col, '').replace('%', '').replace(',', '').strip()
         raw_pct = re.sub(r'[^\d.\-]', '', raw_pct)
@@ -1279,6 +1305,12 @@ def parse_sheet_universal(rows: list, fund_name: str = "") -> tuple:
         sector = vals.get(sector_col, '')
         if sector and (re.match(r'^[\d.]+$', sector) or '%' in sector):
             sector = ''
+        # If no real rating/sector was found in the data, but we captured
+        # a debt-instrument prefix tag from the name (NCD/CP/TB/etc), use
+        # that as the sector so downstream debt/equity classification has
+        # a signal to work with instead of silently defaulting to equity.
+        if not sector and prefix_debt_tag:
+            sector = prefix_debt_tag
 
         holdings.append({
             "name":   name_val,
@@ -1696,7 +1728,8 @@ def _norm_stock(name: str) -> str:
 DEBT_SECTOR_RE = re.compile(
     r'crisil|care|icra|fitch|ind-ra|aaa|aa\+|aa-|\baa\b|sovereign|'
     r'tbill|t-bill|treps|cblo|repo|gilt|g-sec|sdl|commercial paper|'
-    r'certificate of deposit|fixed deposit|bond|debenture|ncd', re.I)
+    r'certificate of deposit|fixed deposit|\bbond\b|debenture|ncd|'
+    r'\bdebt\b|\bptc\b|securitisation|securitization', re.I)
 
 # Equity sector patterns — if sector matches these, it's definitely equity
 # even if DEBT_SECTOR_RE also matches (e.g. CRISIL Ltd in "Financial Services")
