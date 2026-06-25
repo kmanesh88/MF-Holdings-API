@@ -1155,6 +1155,7 @@ def parse_sheet_universal(rows: list, fund_name: str = "") -> tuple:
 
         if any('isin' in v for v in vl.values()):
             header_row_idx = r
+            sector_col_detected = -1
             for ci, v in vl.items():
                 if 'isin' in v and isin_col < 0:
                     isin_col = ci
@@ -1165,6 +1166,16 @@ def parse_sheet_universal(rows: list, fund_name: str = "") -> tuple:
                         r'%\s*(to|of|net)\s*(nav|aum|asset|net)|nav\s*%|aum\s*%'
                         r'|percentage\s*(to|of)\s*(nav|aum|asset|net)', v):
                     pct_col = ci
+                # Detect the actual rating/sector/industry column by header
+                # text rather than assuming a fixed offset from ISIN --
+                # different AMCs put Coupon%, Quantity, or other columns
+                # immediately after ISIN, with Rating/Industry further
+                # along (e.g. HDFC: ISIN, Coupon%, Name, Industry+/Rating).
+                # A fixed isin_col+1 offset silently grabs the wrong
+                # column on these layouts and loses all rating data.
+                if sector_col_detected < 0 and re.search(
+                        r'industry|sector|rating', v):
+                    sector_col_detected = ci
             break
 
     if header_row_idx < 0 or isin_col < 0:
@@ -1260,7 +1271,11 @@ def parse_sheet_universal(rows: list, fund_name: str = "") -> tuple:
         if pct <= 0 or pct > 100:
             continue
 
-        sector_col = isin_col + 1
+        # Use the header-detected rating/industry column if found; fall
+        # back to the old isin_col+1 heuristic only when no such header
+        # exists (some AMC layouts genuinely do put sector right after
+        # ISIN with no explicit header text to detect).
+        sector_col = sector_col_detected if sector_col_detected >= 0 else isin_col + 1
         sector = vals.get(sector_col, '')
         if sector and (re.match(r'^[\d.]+$', sector) or '%' in sector):
             sector = ''
