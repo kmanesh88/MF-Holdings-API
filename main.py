@@ -38,11 +38,63 @@ app = FastAPI(title="MF Holdings API", version="7.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
                    allow_methods=["GET","POST","DELETE"], allow_headers=["*"])
 
+# ════════════════════════════════════════════════════════════════
+# PERSISTENCE -- Firestore-backed, not local filesystem.
+#
+# Render's filesystem (including /tmp) is EPHEMERAL -- it is wiped on
+# every service restart, which happens routinely (free tier sleep/wake,
+# every redeploy, periodic maintenance even on paid tiers without an
+# explicit persistent disk attached). Storing holdings_db as a local
+# JSON file meant every upload appeared to succeed in the moment, but
+# was silently lost on the next restart -- the server would keep
+# serving whatever snapshot happened to survive, while new uploads
+# never durably accumulated. This was a real, confirmed bug (server
+# stuck at 768 funds / a stale April timestamp despite many uploads).
+#
+# Fix: persist holdings_db to Firestore instead, sharded across
+# multiple documents (Firestore's 1MB-per-document limit means the
+# full 768+ fund dataset cannot fit in a single doc -- same constraint
+# already solved on the client side for AMC factsheet data earlier in
+# this project). A local JSON cache is still kept as a fast in-memory
+# mirror and a fallback if Firestore is temporarily unreachable, but
+# Firestore is now the source of truth.
+# ════════════════════════════════════════════════════════════════
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/tmp/mf_data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-DB_FILE  = DATA_DIR / "holdings.json"
+DB_FILE  = DATA_DIR / "holdings.json"  # local fallback cache only, not source of truth
 holdings_db: dict = {}
 _amfi_cap_cache: dict = {}
+_firestore_db = None  # lazily initialized Firestore client, None if unavailable
+
+FIRESTORE_SHARD_SIZE = 40  # funds per shard document, tuned to stay well under 1MB
+
+def _get_firestore_client():
+    """Lazily initialize the Firebase Admin SDK / Firestore client from a
+    service account JSON provided via the FIREBASE_SERVICE_ACCOUNT_JSON
+    environment variable (set in Render's dashboard, never committed to
+    the repo). Returns None if not configured or initialization fails --
+    callers must handle that gracefully and fall back to local cache.
+    """
+    global _firestore_db
+    if _firestore_db is not None:
+        return _firestore_db
+    try:
+        import firebase_admin
+        from firebase_admin import credentials, firestore as fb_firestore
+        sa_json = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "")
+        if not sa_json:
+            log.warning("FIREBASE_SERVICE_ACCOUNT_JSON not set -- holdings_db will NOT "
+                        "persist across server restarts. Set this env var in Render to fix.")
+            return None
+        if not firebase_admin._apps:
+            cred = credentials.Certificate(json.loads(sa_json))
+            firebase_admin.initialize_app(cred)
+        _firestore_db = fb_firestore.client()
+        log.info("Firestore client initialized successfully")
+        return _firestore_db
+    except Exception as e:
+        log.error(f"Firestore initialization failed: {e}. holdings_db will NOT persist.")
+        return None
 
 # ---------------------------------------------------------------------------
 # AMFI CAP MAP — loaded once from bundled Excel at startup
@@ -94,16 +146,102 @@ AMFI_ISIN_CAP.update(ISIN_OVERRIDES)
 log.info(f"ISIN overrides applied: {len(ISIN_OVERRIDES)} entries")
 
 def save_db():
-    try: DB_FILE.write_text(json.dumps(holdings_db, ensure_ascii=False))
-    except Exception as e: log.warning(f"Save failed: {e}")
+    """Persist holdings_db to Firestore (sharded across multiple documents
+    to stay under the 1MB-per-document limit), plus a local JSON cache as
+    a fast fallback. Firestore is the durable store; the local file is
+    disposable and only used to avoid a network round-trip on every read
+    within a single server lifetime.
+    """
+    try:
+        DB_FILE.write_text(json.dumps(holdings_db, ensure_ascii=False))
+    except Exception as e:
+        log.warning(f"Local cache save failed (non-fatal): {e}")
+
+    db = _get_firestore_client()
+    if db is None:
+        log.warning("Firestore unavailable -- holdings_db saved locally only, "
+                     "WILL BE LOST on next restart")
+        return
+
+    try:
+        keys = sorted(holdings_db.keys())
+        shards = [keys[i:i + FIRESTORE_SHARD_SIZE] for i in range(0, len(keys), FIRESTORE_SHARD_SIZE)]
+        batch = db.batch()
+        batch_count = 0
+        for shard_idx, shard_keys in enumerate(shards):
+            shard_data = {k: holdings_db[k] for k in shard_keys}
+            doc_ref = db.collection("mf_holdings_shards").document(f"shard_{shard_idx}")
+            batch.set(doc_ref, {"keys": shard_keys, "data": shard_data})
+            batch_count += 1
+            # Firestore batches cap at 500 operations -- commit and start a
+            # fresh batch well before that if a future dataset grows huge
+            if batch_count >= 400:
+                batch.commit()
+                batch = db.batch()
+                batch_count = 0
+        if batch_count > 0:
+            batch.commit()
+        # Clean up any stale shard documents from a previous save that had
+        # MORE shards than this one (e.g. after bulk deletes) -- otherwise
+        # old shard docs linger forever with stale data that load_db()
+        # would incorrectly merge back in on next startup
+        meta_ref = db.collection("mf_holdings_shards").document("_meta")
+        prev_meta = meta_ref.get()
+        prev_shard_count = prev_meta.to_dict().get("shard_count", 0) if prev_meta.exists else 0
+        if prev_shard_count > len(shards):
+            cleanup_batch = db.batch()
+            for i in range(len(shards), prev_shard_count):
+                cleanup_batch.delete(db.collection("mf_holdings_shards").document(f"shard_{i}"))
+            cleanup_batch.commit()
+        meta_ref.set({"shard_count": len(shards), "total_funds": len(holdings_db),
+                      "updated_at": datetime.utcnow().isoformat()})
+        log.info(f"Saved {len(holdings_db)} funds to Firestore across {len(shards)} shards")
+    except Exception as e:
+        log.error(f"Firestore save FAILED: {e} -- holdings_db only saved locally, "
+                  f"WILL BE LOST on next restart")
 
 def load_db():
+    """Load holdings_db from Firestore (source of truth). Falls back to
+    the local JSON cache only if Firestore is unreachable -- which means
+    falling back to whatever happened to survive on local disk, the same
+    fragile behavior we're moving away from, but better than starting
+    completely empty.
+    """
     global holdings_db
+    db = _get_firestore_client()
+    if db is not None:
+        try:
+            shard_docs = db.collection("mf_holdings_shards").stream()
+            loaded = {}
+            shard_count = 0
+            for doc in shard_docs:
+                if doc.id == "_meta":
+                    continue
+                shard_data = doc.to_dict().get("data", {})
+                loaded.update(shard_data)
+                shard_count += 1
+            if loaded:
+                holdings_db = loaded
+                log.info(f"Loaded {len(holdings_db)} funds from Firestore ({shard_count} shards)")
+                try:
+                    DB_FILE.write_text(json.dumps(holdings_db, ensure_ascii=False))
+                except Exception:
+                    pass
+                return
+            log.info("Firestore reachable but no holdings data found yet (fresh database)")
+            return
+        except Exception as e:
+            log.error(f"Firestore load FAILED: {e} -- falling back to local cache")
+
+    # Firestore unavailable or empty -- fall back to local file (fragile,
+    # may be stale or missing entirely after a restart)
     try:
         if DB_FILE.exists():
             holdings_db = json.loads(DB_FILE.read_text())
-            log.info(f"Loaded {len(holdings_db)} funds from disk")
-    except Exception as e: log.warning(f"Load failed: {e}")
+            log.warning(f"Loaded {len(holdings_db)} funds from LOCAL CACHE ONLY -- "
+                        f"Firestore was unavailable, this data may be stale")
+    except Exception as e:
+        log.warning(f"Local cache load failed: {e}")
 
 # AMC UPLOAD AGENT -- Plan, Act, Verify, Repair, Report
 # Same shape as the market-data agent, applied to stock classification
@@ -1694,6 +1832,44 @@ async def root():
 async def health():
     amcs = sorted({v["amc"] for v in holdings_db.values()})
     return {"status": "ok", "funds": len(holdings_db), "amcs": amcs}
+
+@app.get("/debug-firestore")
+async def debug_firestore():
+    """Diagnostic: confirms whether Firestore persistence is actually
+    configured and working, separate from whether holdings_db happens to
+    have data in memory right now. Use this to verify the
+    FIREBASE_SERVICE_ACCOUNT_JSON env var is set correctly on Render
+    BEFORE relying on uploads surviving a restart.
+    """
+    sa_json_set = bool(os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", ""))
+    db = _get_firestore_client()
+    result = {
+        "service_account_env_var_set": sa_json_set,
+        "firestore_client_initialized": db is not None,
+        "holdings_db_in_memory": len(holdings_db),
+    }
+    if db is not None:
+        try:
+            meta_ref = db.collection("mf_holdings_shards").document("_meta")
+            meta = meta_ref.get()
+            if meta.exists:
+                result["firestore_meta"] = meta.to_dict()
+            else:
+                result["firestore_meta"] = "no _meta doc yet -- nothing saved to Firestore so far"
+            # Round-trip write test -- proves the service account actually
+            # has write permission, not just that the client initialized
+            test_ref = db.collection("mf_holdings_shards").document("_healthcheck")
+            test_ref.set({"ts": datetime.utcnow().isoformat()})
+            test_read = test_ref.get()
+            result["write_read_test"] = "PASSED" if test_read.exists else "FAILED"
+        except Exception as e:
+            result["firestore_error"] = str(e)[:300]
+    else:
+        result["reason"] = ("FIREBASE_SERVICE_ACCOUNT_JSON not set in Render's environment "
+                            "variables" if not sa_json_set else
+                            "Service account JSON is set but client initialization failed -- "
+                            "check Render logs for the exact error")
+    return result
 
 @app.get("/funds")
 async def list_funds(amc: Optional[str] = None):
