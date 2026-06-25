@@ -964,7 +964,8 @@ def parse_sheet_universal(rows: list, fund_name: str = "") -> tuple:
                         ['name of', 'instrument', 'issuer', 'company/issuer', 'company']):
                     name_col = ci
                 if pct_col < 0 and re.search(
-                        r'%\s*(to|of|net)\s*(nav|aum|asset|net)|nav\s*%|aum\s*%', v):
+                        r'%\s*(to|of|net)\s*(nav|aum|asset|net)|nav\s*%|aum\s*%'
+                        r'|percentage\s*(to|of)\s*(nav|aum|asset|net)', v):
                     pct_col = ci
             break
 
@@ -978,10 +979,15 @@ def parse_sheet_universal(rows: list, fund_name: str = "") -> tuple:
         hrow = {i: str(c or '').strip().lower()
                 for i, c in enumerate(rows[header_row_idx] or [])}
         for ci in range(max(hrow.keys(), default=0), isin_col, -1):
-            if '%' in hrow.get(ci, '') or 'nav' in hrow.get(ci, ''):
+            if '%' in hrow.get(ci, '') or 'nav' in hrow.get(ci, '') or 'percentage' in hrow.get(ci, ''):
                 pct_col = ci; break
         if pct_col < 0:
-            pct_col = max(hrow.keys(), default=isin_col + 4)
+            # Last resort -- previously defaulted straight to the rightmost
+            # column, which silently grabbed the wrong field entirely on
+            # files with extra trailing columns (Yield/YTC/Maturity Date
+            # after the real percentage column). Prefer a column closer to
+            # the ISIN/name columns over the absolute rightmost one.
+            pct_col = isin_col + 4 if (isin_col + 4) in hrow else max(hrow.keys(), default=isin_col + 4)
 
     # Detect name offset (Kotak-style indented rows)
     actual_name_col = name_col
@@ -1097,9 +1103,24 @@ def _is_kotak_format(wb) -> bool:
     return False
 
 def _is_single_fund(wb) -> bool:
-    if len(wb.sheetnames) != 1: return False
-    ws = wb[wb.sheetnames[0]]
-    for row in ws.iter_rows(max_row=5, values_only=True):
+    """Detects the common 'one main holdings sheet + supplementary sheets'
+    pattern (e.g. HSBC: 'HEHYBF' + 'Notes' + 'Disclaimer'). Previously this
+    required EXACTLY 1 sheet total, which incorrectly rejected files that
+    have the single-fund layout but also include standard supplementary
+    sheets like Notes/Disclaimer/Legend -- those are near-universal
+    across AMC disclosures and don't make a file multi-fund.
+    """
+    SUPPLEMENTARY_SHEET_NAMES = {
+        'notes', 'disclaimer', 'legend', 'abbreviations', 'glossary',
+        'definitions', 'disclosure', 'index', 'cover', 'contents',
+    }
+    # Identify "real" data sheets -- those NOT matching a known
+    # supplementary sheet name
+    data_sheets = [s for s in wb.sheetnames if s.strip().lower() not in SUPPLEMENTARY_SHEET_NAMES]
+    if len(data_sheets) != 1:
+        return False
+    ws = wb[data_sheets[0]]
+    for row in ws.iter_rows(max_row=8, values_only=True):
         if any('isin' in str(c or '').lower() for c in row):
             return True
     return False
@@ -1253,7 +1274,17 @@ def parse_kotak_style(wb, amc_name: str) -> dict:
 # =============================================================================
 def parse_single_fund(wb, amc_name: str, filename: str = "") -> dict:
     out = {}
-    ws   = wb[wb.sheetnames[0]]
+    # Use the same supplementary-sheet-aware selection as _is_single_fund --
+    # don't assume the data sheet is always sheetnames[0], since some AMCs
+    # order supplementary sheets (Notes/Disclaimer/Legend) before the main
+    # holdings sheet.
+    SUPPLEMENTARY_SHEET_NAMES = {
+        'notes', 'disclaimer', 'legend', 'abbreviations', 'glossary',
+        'definitions', 'disclosure', 'index', 'cover', 'contents',
+    }
+    data_sheets = [s for s in wb.sheetnames if s.strip().lower() not in SUPPLEMENTARY_SHEET_NAMES]
+    sheet_name = data_sheets[0] if data_sheets else wb.sheetnames[0]
+    ws   = wb[sheet_name]
     rows = list(ws.iter_rows(values_only=True))
     if len(rows) < 3: return out
 
