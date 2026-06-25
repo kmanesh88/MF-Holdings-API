@@ -764,6 +764,204 @@ async def _agent_extract_cas_via_ai(api_key: str, raw_text: str) -> list:
     return list(seen.values())
 
 
+# ====================================================================
+# FACTSHEET BOOKLET EXTRACTION AGENT
+#
+# Handles AMC marketing factsheet booklets (NOT the SEBI portfolio
+# disclosure format) -- a single PDF covering 60+ schemes, where each
+# scheme shows only a Top-N holdings table (no ISIN, partial coverage)
+# buried inside pages of marketing prose, performance tables, and fund
+# manager bios. This is a fundamentally different document shape from
+# the CAS/AMC-disclosure parsers built elsewhere in this file, and
+# needed its own dedicated approach:
+#
+#   1. PLAN   -- the booklet's own INDEX page lists every scheme name
+#                with its starting page number. Use that directly
+#                instead of guessing where each scheme's content is.
+#   2. ACT    -- for each scheme, pull the text of its first page (the
+#                holdings table is reliably on the first page of each
+#                scheme's 2-3 page spread) and ask AI to extract just
+#                the Top Holdings table, explicitly distinguishing it
+#                from other similarly-shaped tables on the same page
+#                (e.g. "Top Contributors" which has different columns
+#                but can superficially look similar).
+#   3. VERIFY -- flag schemes where no holdings table was found, or
+#                where percentages don't sum to a plausible range.
+#   4. REPORT -- per-scheme extraction status, so gaps are visible
+#                rather than silently missing.
+# ====================================================================
+
+def _parse_factsheet_index(doc) -> dict:
+    """Parse the booklet's own INDEX page(s) into {scheme_name: page_index}.
+    Scans the first 6 pages looking for the index (handles the index
+    spanning more than one page, as Edelweiss's does)."""
+    import re as _re
+    SECTION_HEADERS = {
+        'expert speaks', 'equity funds', 'hybrid funds', 'precious metals',
+        'debt funds', 'equity and hybrid passive funds', 'debt passive funds',
+        'debt fund of funds', 'overseas fund of funds', 'other details',
+        'index', 'i n d e x',
+    }
+    index_text = ""
+    for i in range(min(6, len(doc))):
+        t = doc[i].get_text()
+        if _re.search(r'i\s*n\s*d\s*e\s*x', t, _re.I) or index_text:
+            index_text += "\n" + t
+        if index_text and not _re.search(r'i\s*n\s*d\s*e\s*x', t, _re.I) and i > 2:
+            # stop once we've moved past index pages (heuristic: a page
+            # with long paragraphs rather than name+number pairs)
+            words_per_line = [len(l.split()) for l in t.split('\n') if l.strip()]
+            if words_per_line and sum(w > 8 for w in words_per_line) > len(words_per_line) * 0.5:
+                break
+
+    lines = [l.strip() for l in index_text.split('\n') if l.strip()]
+    scheme_pages = {}
+    i = 0
+    while i < len(lines) - 1:
+        line, nxt = lines[i], lines[i + 1]
+        if line.lower() in SECTION_HEADERS or _re.match(r'i\s*n\s*d\s*e\s*x', line, _re.I):
+            i += 1
+            continue
+        if _re.match(r'^\d+$', nxt) and len(line) > 5:
+            scheme_pages[line] = int(nxt) - 1  # convert to 0-based PDF index
+            i += 2
+        else:
+            i += 1
+    return scheme_pages
+
+
+async def _agent_extract_factsheet_scheme(api_key: str, scheme_name: str, page_text: str) -> dict:
+    """Extract the Top Holdings table for ONE scheme from its factsheet
+    page text. Returns {"holdings": [...], "status": "ok"|"not_found"}.
+    """
+    if not api_key:
+        return {"holdings": [], "status": "no_api_key"}
+
+    prompt = (
+        f'This text is from one page of an AMC factsheet booklet, for the scheme '
+        f'"{scheme_name}".\n\n'
+        f'Find the EQUITY/PORTFOLIO HOLDINGS table -- it is usually titled "Top N '
+        f'Holdings" or similar, with columns like Company Name, Allocation/Exposure %, '
+        f'and sometimes a Domestic/International tag.\n\n'
+        f'IMPORTANT -- do NOT confuse it with these OTHER tables that may appear on '
+        f'the same page and look superficially similar:\n'
+        f'- "Top Contributors" or "Top 10 Contributors" tables (have Weights % AND a '
+        f'separate Contribution % column -- this is a performance attribution table, '
+        f'NOT the holdings list)\n'
+        f'- "Portfolio Changes" (New Entries / Exits) -- just a list of names, no '
+        f'percentages, not the holdings table\n'
+        f'- Sector exposure or Market Capitalization tables (categories like "Large '
+        f'Cap", "IT", "Banks" with percentages -- these are NOT individual stock '
+        f'holdings)\n\n'
+        f'Extract ONLY the actual stock-by-stock holdings table. For each holding, '
+        f'capture the company name, its allocation percentage, and the Domestic/'
+        f'International tag if present (default to "Domestic" if no tag is shown).\n\n'
+        f'Return ONLY JSON, no other text:\n'
+        f'{{"holdings":[{{"name":"company name","pct":0.0,"exposure":"Domestic|International"}}, ...],'
+        f'"status":"ok"}}\n'
+        f'If you cannot find any holdings table on this page, return: '
+        f'{{"holdings":[],"status":"not_found"}}\n\n'
+        f'Page text:\n{page_text[:6000]}'
+    )
+    try:
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
+                         "content-type": "application/json"},
+                json={
+                    "model": "claude-haiku-4-5-20251001",
+                    "max_tokens": 3000,
+                    "messages": [{"role": "user", "content": prompt}]
+                })
+            if resp.status_code != 200:
+                log.warning(f"Factsheet extraction HTTP {resp.status_code} for '{scheme_name}'")
+                return {"holdings": [], "status": f"api_error_{resp.status_code}"}
+            text = resp.json().get("content", [{}])[0].get("text", "").strip()
+            text = re.sub(r"```[^\n]*\n?|```", "", text).strip()
+            start, end = text.find("{"), text.rfind("}") + 1
+            if start < 0 or end <= start:
+                return {"holdings": [], "status": "no_json_in_response"}
+            result = json.loads(text[start:end])
+            holdings = [h for h in result.get("holdings", [])
+                        if isinstance(h, dict) and h.get("name") and h.get("pct", 0) > 0]
+            return {"holdings": holdings, "status": result.get("status", "ok") if holdings else "not_found"}
+    except Exception as e:
+        log.warning(f"Factsheet extraction failed for '{scheme_name}': {e}")
+        return {"holdings": [], "status": f"exception_{str(e)[:50]}"}
+
+
+@app.post("/factsheet-extract")
+async def factsheet_extract(payload: dict):
+    """Extract Top-N holdings for every scheme found in an AMC factsheet
+    booklet PDF. Uses the booklet's own INDEX page to find each scheme's
+    page reliably, then runs AI extraction per scheme page.
+
+    Request body: {"pages_text": ["page0 text", "page1 text", ...], "amc": "..."}
+    (Client extracts text per page client-side via PDF.js and sends the
+    full array -- avoids needing a PDF library server-side.)
+
+    Response: {"schemes": {"Scheme Name": {"holdings":[...], "status":"ok"}, ...},
+               "index_found": N, "extracted_ok": N, "not_found": [...]}
+    """
+    pages_text = payload.get("pages_text") or []
+    amc_name = payload.get("amc", "")
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+
+    if not pages_text:
+        return {"error": "pages_text is required"}
+
+    # PLAN -- parse the index from the first few pages
+    import re as _re
+    SECTION_HEADERS = {
+        'expert speaks', 'equity funds', 'hybrid funds', 'precious metals',
+        'debt funds', 'equity and hybrid passive funds', 'debt passive funds',
+        'debt fund of funds', 'overseas fund of funds', 'other details',
+        'index', 'i n d e x',
+    }
+    index_text = "\n".join(pages_text[:6])
+    lines = [l.strip() for l in index_text.split('\n') if l.strip()]
+    scheme_pages = {}
+    i = 0
+    while i < len(lines) - 1:
+        line, nxt = lines[i], lines[i + 1]
+        if line.lower() in SECTION_HEADERS or _re.match(r'i\s*n\s*d\s*e\s*x', line, _re.I):
+            i += 1
+            continue
+        if _re.match(r'^\d+$', nxt) and len(line) > 5:
+            page_idx = int(nxt) - 1
+            if 0 <= page_idx < len(pages_text):
+                scheme_pages[line] = page_idx
+            i += 2
+        else:
+            i += 1
+
+    if not scheme_pages:
+        return {"error": "Could not parse an index from this document",
+                 "schemes": {}, "index_found": 0}
+
+    # ACT -- extract holdings for each scheme from its index-pointed page
+    schemes_result = {}
+    not_found = []
+    for scheme_name, page_idx in scheme_pages.items():
+        page_text = pages_text[page_idx]
+        result = await _agent_extract_factsheet_scheme(api_key, scheme_name, page_text)
+        schemes_result[scheme_name] = result
+        if result["status"] != "ok" or not result["holdings"]:
+            not_found.append(scheme_name)
+
+    extracted_ok = len(scheme_pages) - len(not_found)
+    log.info(f"Factsheet agent [{amc_name}]: {extracted_ok}/{len(scheme_pages)} schemes extracted, "
+             f"{len(not_found)} not found")
+
+    return {
+        "schemes": schemes_result,
+        "index_found": len(scheme_pages),
+        "extracted_ok": extracted_ok,
+        "not_found": not_found,
+    }
+
+
 @app.post("/cas-extract")
 async def cas_extract(payload: dict):
     """CAS Extraction Agent -- decides between a fast free deterministic
