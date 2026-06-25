@@ -620,17 +620,17 @@ def _cas_verify_extraction(funds: list, raw_text: str) -> dict:
                     continue
 
     # ── Check 2: per-row plausibility (value vs cost ratio) ──
+    # Tightened from 10x to 5.5x after a real extraction error slipped
+    # through at ~6x (Franklin India Mid Cap folio mismerge found in
+    # testing) -- a 5x+ gain (500%) on a single holding is rare enough in
+    # practice that it's worth a closer look rather than auto-accepting.
     implausible_rows = []
     for f in funds:
         cost = f.get("cost", 0) or 0
         value = f.get("value", 0) or 0
         if cost > 0 and value > 0:
             ratio = value / cost
-            # A holding more than 10x cost (1000% gain) or showing value
-            # less than 10% of cost with no realized-loss context is very
-            # unusual for typical equity/debt mutual fund holdings and is
-            # a strong signal the wrong column was picked for this row
-            if ratio > 10 or ratio < 0.1:
+            if ratio > 5.5 or ratio < 0.1:
                 implausible_rows.append({"name": f.get("name"), "cost": cost, "value": value, "ratio": round(ratio, 2)})
 
     if stated_total is None:
