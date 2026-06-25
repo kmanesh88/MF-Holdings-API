@@ -1151,7 +1151,17 @@ def parse_sheet_universal(rows: list, fund_name: str = "") -> tuple:
                         and 'mutual fund' not in vlo
                         and 'asset management' not in vlo
                         and not fund_name):
-                    fund_name = v
+                    # Strip the long SEBI-mandated scheme description AMCs
+                    # append in parentheses (e.g. "HDFC Low Duration Fund
+                    # (An open ended low duration debt scheme investing in
+                    # instruments such that...)") -- this is regulatory
+                    # boilerplate, not part of the fund's actual name, and
+                    # was previously shown in full across the UI everywhere
+                    # this detected name surfaces (fund cards, dropdowns,
+                    # etc). Fixed once here since this detection is shared
+                    # by every caller (parse_single_fund, parse_kotak_style,
+                    # parse_uti all route through this same function).
+                    fund_name = re.sub(r'\s*\([^)]{20,}\)\s*$', '', v).strip()
 
         if any('isin' in v for v in vl.values()):
             header_row_idx = r
@@ -1542,6 +1552,9 @@ def parse_single_fund(wb, amc_name: str, filename: str = "") -> dict:
         if fund_name: break
     if not fund_name:
         fund_name = re.sub(r'\.xlsx?$', '', filename, flags=re.I).strip()
+    # Description-stripping for fund_name detected here is handled
+    # centrally inside parse_sheet_universal (shared by all callers).
+    fund_name = re.sub(r'\s*\([^)]{20,}\)\s*$', '', fund_name).strip()
 
     holdings, cash_pct, detected = parse_sheet_universal(rows, fund_name)
     if not fund_name: fund_name = detected or filename
