@@ -566,7 +566,20 @@ async def _agent_resolve_fund_name(api_key: str, cas_name: str, candidates: list
 # ════════════════════════════════════════════════════════════════
 
 def _cas_verify_extraction(funds: list, raw_text: str) -> dict:
-    """VERIFY step -- did the deterministic parse actually work?"""
+    """VERIFY step -- did the extraction actually work?
+
+    Two independent checks:
+    1. Reconciliation against the document's own "Grand Total" row, being
+       careful to pick the MKT VALUE figure specifically -- the Grand
+       Total row has multiple numbers (Cost, Mkt Value, Unrealized G/L,
+       Total Returns...) in sequence, and grabbing "the first number
+       after Grand Total" silently picks up Cost instead of Mkt Value,
+       which previously caused the verify step itself to compare against
+       the wrong ground truth and approve a wrong extraction.
+    2. Per-row plausibility -- value should never be wildly disproportionate
+       to cost (catches the AI picking the wrong column on individual rows,
+       which can partially cancel out in the total and slip past check #1).
+    """
     if not funds:
         return {"ok": False, "reason": "no_funds_found"}
 
@@ -574,38 +587,64 @@ def _cas_verify_extraction(funds: list, raw_text: str) -> dict:
     if total_extracted <= 0:
         return {"ok": False, "reason": "zero_total_value"}
 
-    # Look for a stated total in the document text to reconcile against
-    # (handles "Grand Total", "Total Portfolio Value", "Total Value" etc,
-    # common across CAMS, KFintech, and platform-specific statements)
-    total_patterns = [
-        r'grand\s*total[^\d]{0,30}?([\d,]{4,}\.?\d*)',
-        r'total\s*portfolio\s*value[^\d]{0,30}?([\d,]{4,}\.?\d*)',
-        r'total\s*value[^\d]{0,30}?([\d,]{4,}\.?\d*)',
-        r'total\s*current\s*value[^\d]{0,30}?([\d,]{4,}\.?\d*)',
-    ]
+    # ── Check 1: reconcile against Grand Total's MKT VALUE column ──
+    # Strategy: find the "Grand Total" line, then look at ALL numbers on
+    # that line/nearby text. The Mkt Value is the 2nd large rupee figure
+    # in sequence (Cost, Mkt Value, Unrealized G/L, ...) -- not simply
+    # the first number found after the words "Grand Total".
     stated_total = None
-    for pat in total_patterns:
-        m = re.search(pat, raw_text, re.I)
-        if m:
-            try:
-                v = float(m.group(1).replace(",", ""))
-                if v > 0:
-                    stated_total = v
+    grand_total_match = re.search(r'grand\s*total([^\n]{0,200})', raw_text, re.I)
+    if grand_total_match:
+        line_after = grand_total_match.group(1)
+        nums = [float(n.replace(",", "")) for n in re.findall(r'[\d,]{4,}\.?\d*', line_after)]
+        # Filter to plausible portfolio-value-sized numbers (reject tiny
+        # ones like XIRR% or holding-period-months that might get caught)
+        large_nums = [n for n in nums if n >= 1000]
+        if len(large_nums) >= 2:
+            # Column order is Cost, Mkt Value, Unrealized G/L, ... --
+            # so index 1 (the SECOND large number) is Mkt Value
+            stated_total = large_nums[1]
+        elif len(large_nums) == 1:
+            stated_total = large_nums[0]
+
+    # Also try alternative explicit labels some platforms use
+    if stated_total is None:
+        for pat in [r'total\s*portfolio\s*value[^\d]{0,30}?([\d,]{4,}\.?\d*)',
+                    r'total\s*current\s*value[^\d]{0,30}?([\d,]{4,}\.?\d*)']:
+            m = re.search(pat, raw_text, re.I)
+            if m:
+                try:
+                    stated_total = float(m.group(1).replace(",", ""))
                     break
-            except ValueError:
-                continue
+                except ValueError:
+                    continue
+
+    # ── Check 2: per-row plausibility (value vs cost ratio) ──
+    implausible_rows = []
+    for f in funds:
+        cost = f.get("cost", 0) or 0
+        value = f.get("value", 0) or 0
+        if cost > 0 and value > 0:
+            ratio = value / cost
+            # A holding more than 10x cost (1000% gain) or showing value
+            # less than 10% of cost with no realized-loss context is very
+            # unusual for typical equity/debt mutual fund holdings and is
+            # a strong signal the wrong column was picked for this row
+            if ratio > 10 or ratio < 0.1:
+                implausible_rows.append({"name": f.get("name"), "cost": cost, "value": value, "ratio": round(ratio, 2)})
 
     if stated_total is None:
-        # No stated total found to check against -- accept the parse as
-        # long as it found at least one fund with a real value (can't
-        # verify reconciliation, but no evidence of failure either)
+        if implausible_rows:
+            return {"ok": False, "reason": "implausible_rows", "extracted_total": total_extracted,
+                    "implausible_rows": implausible_rows[:5]}
         return {"ok": True, "reason": "no_total_to_check", "extracted_total": total_extracted}
 
     diff_pct = abs(total_extracted - stated_total) / stated_total * 100
-    if diff_pct <= 5:
+    if diff_pct <= 5 and not implausible_rows:
         return {"ok": True, "reason": "reconciled", "extracted_total": total_extracted, "stated_total": stated_total}
-    return {"ok": False, "reason": "totals_mismatch", "extracted_total": total_extracted,
-            "stated_total": stated_total, "diff_pct": round(diff_pct, 1)}
+    return {"ok": False, "reason": "totals_mismatch" if diff_pct > 5 else "implausible_rows",
+            "extracted_total": total_extracted, "stated_total": stated_total,
+            "diff_pct": round(diff_pct, 1), "implausible_rows": implausible_rows[:5]}
 
 
 async def _agent_extract_cas_via_ai(api_key: str, raw_text: str) -> list:
@@ -633,8 +672,29 @@ async def _agent_extract_cas_via_ai(api_key: str, raw_text: str) -> list:
         f'(could be from CAMS, KFintech, or a platform like Scripbox, Groww, Kuvera, '
         f'ETMoney, INDmoney -- the exact layout varies by provider).\n\n'
         f'Extract EVERY individual mutual fund HOLDING row mentioned -- each row '
-        f'represents one folio/purchase, with its own units, cost, and current '
-        f'market value.\n\n'
+        f'represents one folio/purchase.\n\n'
+        f'COLUMN MAPPING -- these statements typically have MANY numeric columns per '
+        f'row (Cost, Mkt Value, Unrealized G/L, Realized Gain/Loss, Dividend Paid '
+        f'Since Inception, XIRR %, Total Returns, % to Portfolio, Holding Period, '
+        f'Purchase Price per unit, Nav per unit, G/L %). You must map them precisely '
+        f'-- do NOT guess or substitute one for another:\n'
+        f'- "value" = the column literally labeled "Mkt Value" (current market value '
+        f'of the holding TODAY). This is usually the 2nd large rupee figure on the '
+        f'row, right after Cost. It is NOT "Total Returns", NOT "Dividend Paid Since '
+        f'Inception", and NOT the per-unit "Nav" price.\n'
+        f'- "cost" = the column literally labeled "Cost" or "Purchase Price" total '
+        f'(the original investment amount). This is usually the 1st large rupee '
+        f'figure on the row, before Mkt Value.\n'
+        f'- "units" = the units held (a decimal number, typically 1-6 digits before '
+        f'the decimal point, e.g. 4808.151) -- NOT the folio number, NOT the NAV.\n'
+        f'- Ignore entirely: Unrealized G/L, Realized Gain/Loss, Dividend Paid Since '
+        f'Inception, XIRR %, Total Returns, % to Portfolio, Holding Period (Months), '
+        f'per-unit Purchase Price, per-unit Nav, G/L %. These are NOT cost or value.\n\n'
+        f'SANITY CHECK before including a row: cost + (any reasonable gain or loss) '
+        f'should be in the same order of magnitude as value. If your extracted value '
+        f'looks wildly different from cost (e.g. 10x+ larger with no clear gain '
+        f'column supporting that), you have likely picked the wrong column -- re-read '
+        f'that row carefully.\n\n'
         f'CRITICAL: The SAME scheme name can legitimately appear MULTIPLE TIMES with '
         f'different folio numbers (e.g. a client invested in "XYZ Mid Cap Fund" via '
         f'5 separate folios over the years). Each occurrence is a SEPARATE real '
