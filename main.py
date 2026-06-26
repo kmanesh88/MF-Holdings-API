@@ -1246,10 +1246,26 @@ SKIP_ROW = re.compile(
 )
 
 CASH_ROW = re.compile(
-    r'^(treps?|triparty\s*repo|reverse\s*repo|cblo|'
+    # Tolerate a leading bullet/label like "(B) ", "C) ", "A)" etc -- some
+    # AMCs (Tata specifically) prefix every line-item including cash rows
+    # with a lettered sub-section marker, which the old start-anchored
+    # pattern didn't allow for. Without this, TREPS/REPO rows on those
+    # sheets were silently NOT counted as cash, which then made the
+    # fund's real holdings total look implausibly low (a Tata Overnight
+    # Fund showing only 3.7% in holdings, when TREPS+REPO actually
+    # account for over 100% combined, correctly recognized as cash).
+    r'^[\(\)A-Za-z]{0,4}[\)\.\s]*\s*(treps?|triparty\s*repo|reverse\s*repo|\brepo\b|cblo|'
     r'cash\s*and\s*other\s*net|net\s*current\s*asset)',
     re.I
 )
+
+# Physical commodity holdings (Gold/Silver ETFs hold the metal itself, not
+# a security) genuinely have no ISIN -- this is correct, not missing data.
+# Without recognizing this pattern, the only/dominant holding in every
+# Gold/Silver ETF scheme was being silently dropped entirely (found via a
+# real Tata Gold ETF file where "GOLD PHYSICAL - PURITY 995" was the
+# scheme's single 97.6%-weight holding with a blank ISIN column).
+COMMODITY_ROW = re.compile(r'\bgold\s*physical\b|\bsilver\s*physical\b|\bphysical\s*gold\b|\bphysical\s*silver\b', re.I)
 
 
 # =============================================================================
@@ -1262,7 +1278,13 @@ def parse_sheet_universal(rows: list, fund_name: str = "") -> tuple:
     """
     header_row_idx = isin_col = name_col = pct_col = -1
 
-    for r, row in enumerate(rows[:15]):
+    # Scan window increased from 15 to 35 rows -- some AMCs (Tata's debt
+    # schemes specifically) include a "Potential Risk Class" matrix table
+    # between the scheme description and the actual holdings header,
+    # pushing the real header (with the 'ISIN' column) past row 15. The
+    # 'isin' keyword requirement below is specific enough that scanning
+    # further doesn't risk false-positive matches on unrelated tables.
+    for r, row in enumerate(rows[:35]):
         if not row: continue
         vals = {i: str(c or '').strip() for i, c in enumerate(row)}
         vl   = {i: v.lower() for i, v in vals.items()}
@@ -1301,7 +1323,14 @@ def parse_sheet_universal(rows: list, fund_name: str = "") -> tuple:
                     # parse_uti all route through this same function).
                     fund_name = re.sub(r'\s*\([^)]{20,}\)\s*$', '', v).strip()
 
-        if any('isin' in v for v in vl.values()):
+        # Use a word-boundary match for 'isin' rather than a plain substring
+        # check -- a real Tata index fund's scheme description sentence
+        # ("...instruments comprISINg of Nifty200 Alpha 30 Index...")
+        # contains the literal substring "isin" inside the word
+        # "comprising", which was being wrongly detected as the real ISIN
+        # header row, locking in garbage column indices before the actual
+        # holdings header further down the sheet was ever reached.
+        if any(re.search(r'\bisin\b', v) for v in vl.values()):
             header_row_idx = r
             sector_col_detected = -1
             for ci, v in vl.items():
@@ -1389,13 +1418,22 @@ def parse_sheet_universal(rows: list, fund_name: str = "") -> tuple:
         isin_val = vals.get(isin_col, '')
         name_val = vals.get(actual_name_col, '').strip()
 
-        if not VALID_ISIN.match(isin_val):
+        is_commodity_holding = bool(COMMODITY_ROW.search(name_val))
+
+        if not VALID_ISIN.match(isin_val) and not is_commodity_holding:
             if name_val and CASH_ROW.match(name_val):
                 raw = vals.get(pct_col, '').replace('%', '').replace(',', '').strip()
                 try:
                     p = float(raw)
                     if pct_is_decimal: p *= 100
-                    if 0 < p < 50: cash_pct += p
+                    # Upper bound raised from 50 to 100 -- Overnight/Liquid
+                    # funds legitimately hold the bulk of their portfolio
+                    # in TREPS/REPO, individually exceeding 50% each (found
+                    # via a real Tata Overnight Fund: TREPS=57.33%,
+                    # REPO=53.6%, both silently dropped by the old 50% cap,
+                    # which made the fund look like it had almost no
+                    # holdings/cash accounted for at all).
+                    if 0 < p <= 100: cash_pct += p
                 except:
                     pass
             continue
@@ -1586,18 +1624,29 @@ def parse_multi_sheet_with_index(wb, amc_name: str) -> dict:
             vals = [str(c or '').strip() for c in row]
             # Try standard pattern: scan for [code, name] pair
             found = False
+            # Keyword list for "this looks like a real scheme name" --
+            # previously only matched fund/scheme/plan, which silently
+            # missed schemes whose name ends in an abbreviation instead
+            # (e.g. Tata's own Index sheet lists "TATA INCOME PLUS
+            # ARBITRAGE ACTIVE FOF" -- FOF = Fund of Funds -- with no
+            # literal word "fund" anywhere in the name). A missed index
+            # entry means that scheme's holdings still parse correctly
+            # (parsing doesn't depend on the name), but it displays under
+            # its raw internal sheet code instead of its real name.
+            NAME_KEYWORDS = ['fund', 'scheme', 'plan', 'fof', 'etf', 'index fund',
+                              'fixed maturity', 'interval']
             for i in range(len(vals) - 1):
                 code = vals[i]; name = vals[i + 1] if i + 1 < len(vals) else ''
                 if (re.match(r'^[A-Z0-9\-]{2,20}$', code)
                         and len(name) > 8
-                        and any(k in name.lower() for k in ['fund', 'scheme', 'plan'])):
+                        and any(k in name.lower() for k in NAME_KEYWORDS)):
                     index_map[code] = name; found = True; break
             if not found:
                 # Try Motilal pattern: [serial, name, code] — name before code
                 for i in range(len(vals) - 1):
                     name = vals[i]; code = vals[i + 1] if i + 1 < len(vals) else ''
                     if (len(name) > 8
-                            and any(k in name.lower() for k in ['fund', 'scheme', 'plan'])
+                            and any(k in name.lower() for k in NAME_KEYWORDS)
                             and re.match(r'^[A-Z0-9\-]{2,20}$', code)):
                         index_map[code] = name; break
 
@@ -1611,9 +1660,25 @@ def parse_multi_sheet_with_index(wb, amc_name: str) -> dict:
         holdings, cash_pct, detected = parse_sheet_universal(rows, fund_name)
         if not fund_name: fund_name = detected or sname
 
-        if len(holdings) >= 2:
+        # Minimum-2-holdings was originally a noise filter (reject sheets
+        # that accidentally parsed garbage as 1 fake row). But genuinely
+        # simple single-asset schemes -- commodity ETFs holding just
+        # physical gold/silver, or some single-instrument FoFs -- have
+        # exactly 1 real holding and were being silently dropped entirely.
+        # A single holding at a high percentage (>=50%) is itself strong
+        # evidence the parse is real, not noise, so allow it through.
+        min_holdings_ok = len(holdings) >= 2 or (len(holdings) == 1 and holdings[0]['pct'] >= 50)
+        if min_holdings_ok:
             total = sum(h['pct'] for h in holdings)
-            if total < 5 or total > 200: continue
+            # Check holdings+cash together, not holdings alone -- Overnight/
+            # Liquid funds are legitimately almost entirely TREPS/REPO cash
+            # by design, with real "holdings" (a few T-Bills) summing to
+            # well under 5%. The old holdings-only check rejected these as
+            # apparently-bad parses, when they were actually correct data
+            # for that fund category (found via a real Tata Overnight Fund
+            # with valid T-Bills at 3.71% + TREPS/REPO at ~111% cash).
+            combined = total + cash_pct
+            if combined < 5 or combined > 200: continue
             key = norm(fund_name)
             out[key] = {"fund_name": fund_name.strip(), "amc": amc_name,
                         "holdings": holdings, "count": len(holdings),
