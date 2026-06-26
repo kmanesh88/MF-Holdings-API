@@ -5,4 +5,4 @@ openpyxl==3.1.5
 xlrd==1.2.0
 python-multipart==0.0.9
 anthropic>=0.40.0
-
+firebase-admin
