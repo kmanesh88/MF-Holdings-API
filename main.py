@@ -2094,7 +2094,40 @@ async def upload(
 
     if total_funds == 0:
         raise HTTPException(422, "No fund data found — check file format")
-    save_db()
+
+    # Capture exactly what save_db() actually did -- surfaced directly in
+    # this response so persistence failures are visible immediately
+    # instead of requiring a separate /debug-firestore check after the
+    # fact (which only shows the CURRENT state, not what happened during
+    # THIS specific upload).
+    save_status = {"local_cache": "unknown", "firestore": "unknown"}
+    try:
+        DB_FILE.write_text(json.dumps(holdings_db, ensure_ascii=False))
+        save_status["local_cache"] = "ok"
+    except Exception as e:
+        save_status["local_cache"] = f"failed: {str(e)[:150]}"
+
+    db = _get_firestore_client()
+    if db is None:
+        save_status["firestore"] = "client_unavailable (check FIREBASE_SERVICE_ACCOUNT_JSON)"
+    else:
+        try:
+            keys = sorted(holdings_db.keys())
+            shards = [keys[i:i + FIRESTORE_SHARD_SIZE] for i in range(0, len(keys), FIRESTORE_SHARD_SIZE)]
+            batch = db.batch()
+            for shard_idx, shard_keys in enumerate(shards):
+                shard_data = {k: holdings_db[k] for k in shard_keys}
+                doc_ref = db.collection("mf_holdings_shards").document(f"shard_{shard_idx}")
+                batch.set(doc_ref, {"keys": shard_keys, "data": shard_data})
+            batch.commit()
+            db.collection("mf_holdings_shards").document("_meta").set({
+                "shard_count": len(shards), "total_funds": len(holdings_db),
+                "updated_at": datetime.utcnow().isoformat()
+            })
+            save_status["firestore"] = f"ok ({len(shards)} shards, {len(holdings_db)} total funds written)"
+        except Exception as e:
+            save_status["firestore"] = f"FAILED: {str(e)[:300]}"
+            log.error(f"Firestore save failed during /upload: {e}")
 
     # Fire the verify/repair agent in the background — doesn't block the
     # upload response, but runs immediately so /amc-health reflects this
@@ -2107,7 +2140,7 @@ async def upload(
 
     return {"status": "ok", "amc": amc, "files": len(files),
             "funds_added": total_funds, "funds_total": len(holdings_db),
-            "funds": fund_names}
+            "funds": fund_names, "save_status": save_status}
 
 @app.post("/preview")
 async def preview_upload(
