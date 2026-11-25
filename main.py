@@ -36,7 +36,11 @@ async def lifespan(app):
 
 app = FastAPI(title="MF Holdings API", version="7.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
-                   allow_methods=["GET","POST","DELETE"], allow_headers=["*"])
+                   allow_methods=["GET","POST","PATCH","DELETE"], allow_headers=["*"])
+
+# Capture module (recording engine for Fluid dataset)
+from capture_router import router as capture_router
+app.include_router(capture_router)
 
 # ════════════════════════════════════════════════════════════════
 # PERSISTENCE -- Firestore-backed, not local filesystem.
