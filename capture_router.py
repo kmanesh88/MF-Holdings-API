@@ -486,9 +486,13 @@ def _session_out(sid, d):
 
 
 @router.get("/sessions")
-def list_sessions(uid: str = Depends(current_advisor)):
+def list_sessions(trash: bool = False, uid: str = Depends(current_advisor)):
     snaps = db().collection(COL).where("advisor_id", "==", uid).stream()
     rows = [_session_out(s.id, s.to_dict()) for s in snaps]
+    rows = [r for r in rows if bool(r.get("deleted_at")) == trash]
+    for r in rows:
+        if isinstance(r.get("deleted_at"), dt.datetime):
+            r["deleted_at"] = r["deleted_at"].isoformat()
     rows.sort(key=lambda r: r.get("created_at") or "", reverse=True)
     for r in rows:   # reviewed counts are cheap enough at this scale
         if r["status"] == "ready":
@@ -595,20 +599,46 @@ def reprocess(sid: str, bg: BackgroundTasks, stage: str = Query("all", pattern="
     return {"ok": True}
 
 
-@router.delete("/sessions/{sid}")
-def delete_session(sid: str, uid: str = Depends(current_advisor)):
-    ref, d = _owned(sid, uid)
+TRASH_DAYS = 30
+
+
+def _hard_delete(ref, d):
     _delete_collection(ref.collection("utterances"))
     for blob in bucket().list_blobs(prefix=os.path.dirname(d["audio_path"]) + "/"):
         blob.delete()
     ref.delete()
+
+
+@router.delete("/sessions/{sid}")
+def delete_session(sid: str, uid: str = Depends(current_advisor)):
+    """Moves to trash. Permanently removed after 30 days (or via /purge)."""
+    ref, d = _owned(sid, uid)
+    ref.update({"deleted_at": now(), "deleted_by": uid})
+    return {"ok": True, "trashed": True, "purge_after_days": TRASH_DAYS}
+
+
+@router.post("/sessions/{sid}/restore")
+def restore_session(sid: str, uid: str = Depends(current_advisor)):
+    ref, d = _owned(sid, uid)
+    ref.update({"deleted_at": None, "deleted_by": None})
     return {"ok": True}
+
+
+def purge_trash(older_than_days: int = TRASH_DAYS) -> int:
+    cutoff = now() - dt.timedelta(days=older_than_days)
+    n = 0
+    for s in db().collection(COL).stream():
+        d = s.to_dict()
+        if d.get("deleted_at") and d["deleted_at"] < cutoff:
+            _hard_delete(s.reference, d)
+            n += 1
+    return n
 
 
 def _client_rows(uid: str, reviewed_only: bool):
     for s in db().collection(COL).where("advisor_id", "==", uid).stream():
         d = s.to_dict()
-        if d.get("status") != "ready":
+        if d.get("status") != "ready" or d.get("deleted_at"):
             continue
         smap = d.get("speaker_map") or {}
         utts = sorted((u.to_dict() for u in s.reference.collection("utterances").stream()),
@@ -647,6 +677,7 @@ def _client_rows(uid: str, reviewed_only: bool):
 @router.get("/stats")
 def stats(uid: str = Depends(current_advisor)):
     sessions = [s.to_dict() for s in db().collection(COL).where("advisor_id", "==", uid).stream()]
+    sessions = [x for x in sessions if not x.get("deleted_at")]
     rows = list(_client_rows(uid, reviewed_only=False))
     by_intent: Dict[str, Dict[str, int]] = {}
     by_lang: Dict[str, int] = {}

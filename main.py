@@ -46,6 +46,10 @@ app.include_router(capture_router)
 from tax_router import router as tax_router
 app.include_router(tax_router)
 
+# Weekly backups (Firestore -> Cloud Storage)
+from backup_router import router as backup_router
+app.include_router(backup_router)
+
 # Alerts module (advisor-facing: client exposure look-through, price-move alerts)
 from alerts_router import router as alerts_router
 app.include_router(alerts_router)

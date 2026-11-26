@@ -1,0 +1,27 @@
+# Weekly full Firestore backup for Vantage (also purges Capture trash older than 30 days).
+# Uses the same repo secret as the tax agent: TAX_AGENT_SECRET.
+name: Weekly backup
+
+on:
+  schedule:
+    - cron: "30 21 * * 6"   # every Sunday 03:00 IST
+  workflow_dispatch:
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wake API (Render free plan sleeps)
+        run: |
+          for i in 1 2 3 4 5 6; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 60 "$API/tax/rules/meta") && [ "$code" = "200" ] && exit 0
+            echo "attempt $i: $code"; sleep 20
+          done
+          exit 1
+        env:
+          API: https://mf-holdings-api.onrender.com
+      - name: Start backup
+        run: curl -sf -X POST "$API/backup/run" -H "X-Agent-Secret: $SECRET"
+        env:
+          API: https://mf-holdings-api.onrender.com
+          SECRET: ${{ secrets.TAX_AGENT_SECRET }}
