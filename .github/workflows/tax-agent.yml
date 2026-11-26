@@ -1,0 +1,35 @@
+# Weekly tax-law check for Vantage · Fluid Tax.
+# Wakes the Render service, then starts the agent. Proposals land in the app for approval.
+# Needs repo secret TAX_AGENT_SECRET (same value as the Render env var TAX_AGENT_SECRET or UPLOAD_SECRET).
+name: Tax law update agent
+
+on:
+  schedule:
+    - cron: "30 3 * * 1"        # every Monday 09:00 IST
+    - cron: "30 3 1-10 2 *"     # daily 1–10 Feb (Union Budget window)
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "all | changes | verify"
+        default: "all"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wake API (Render free plan sleeps)
+        run: |
+          for i in 1 2 3 4 5 6; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 60 "$API/tax/rules/meta") && [ "$code" = "200" ] && exit 0
+            echo "attempt $i: $code"; sleep 20
+          done
+          exit 1
+        env:
+          API: https://mf-holdings-api.onrender.com
+      - name: Start agent run
+        run: |
+          curl -sf -X POST "$API/tax/agent/run?mode=${MODE:-all}" -H "X-Agent-Secret: $SECRET"
+        env:
+          API: https://mf-holdings-api.onrender.com
+          SECRET: ${{ secrets.TAX_AGENT_SECRET }}
+          MODE: ${{ github.event.inputs.mode }}

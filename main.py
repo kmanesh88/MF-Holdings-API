@@ -42,6 +42,10 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"],
 from capture_router import router as capture_router
 app.include_router(capture_router)
 
+# Fluid Tax module (rules, engine, update agent)
+from tax_router import router as tax_router
+app.include_router(tax_router)
+
 # ════════════════════════════════════════════════════════════════
 # PERSISTENCE -- Firestore-backed, not local filesystem.
 #

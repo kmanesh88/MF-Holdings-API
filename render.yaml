@@ -11,5 +11,7 @@ services:
         sync: false   # set manually in Render dashboard
       - key: SARVAM_API_KEY
         sync: false   # set manually in Render dashboard (Capture module)
+      - key: TAX_AGENT_SECRET
+        sync: false   # optional; GitHub Actions tax agent. Falls back to UPLOAD_SECRET
     autoDeploy: true
     plan: free
