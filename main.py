@@ -46,6 +46,10 @@ app.include_router(capture_router)
 from tax_router import router as tax_router
 app.include_router(tax_router)
 
+# Alerts module (advisor-facing: client exposure look-through, price-move alerts)
+from alerts_router import router as alerts_router
+app.include_router(alerts_router)
+
 # ════════════════════════════════════════════════════════════════
 # PERSISTENCE -- Firestore-backed, not local filesystem.
 #
@@ -2020,7 +2024,15 @@ def _enrich_holdings(fund_data: dict) -> dict:
         # Priority 1: ISIN lookup against bundled AMFI Excel (fast, accurate)
         # Priority 2: name-based lookup against live-fetched cache (fallback if file missing)
         # Priority 3: default 'small' — correct per SEBI (everything outside top 250 is small cap)
-        if not is_debt:
+        isin_up = h.get("isin", "").strip().upper()
+        # Foreign ISIN (prefix != IN, e.g. US0231351067) = international equity: it has no Indian
+        # cap category. Previously these fell through to the 'small' default below.
+        if not is_debt and re.match(r"^[A-Z]{2}[A-Z0-9]{9}[0-9]$", isin_up) and not isin_up.startswith("IN"):
+            eh["cap"] = None
+            eh["geo"] = "INTL"
+            eh["country"] = isin_up[:2]
+        elif not is_debt:
+            eh["geo"] = "IN"
             isin_val = h.get("isin", "").strip()
             cap = None
             if isin_val and AMFI_ISIN_CAP:
