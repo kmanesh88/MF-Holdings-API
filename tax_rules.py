@@ -16,7 +16,7 @@ need a code deploy. Every block carries:
 Amounts in INR. Rates in percent.
 """
 
-BASE_VERSION = "2026.11.26c-base"
+BASE_VERSION = "2026.11.26d-base"
 
 META = {
     "jurisdiction": "India",
@@ -514,7 +514,7 @@ ENTITY_ENGINE = {
 def base_ruleset() -> dict:
     import copy
     from tax_rules_ext import (SOURCES_EXT, RESIDENCY, PERSONS, EXTRA_ASSETS, ASSET_CATEGORY, EXTRA_INCOME,
-                               INCOME_CATEGORY, ELIGIBILITY, STRUCTURING, CATEGORIES, DTAA)
+                               INCOME_CATEGORY, ELIGIBILITY, STRUCTURING, CATEGORIES, DTAA, HOME_COUNTRY)
     entities = copy.deepcopy(ENTITIES)
     for k, e in entities.items():
         e.setdefault("group", ENTITY_GROUP.get(k, "Other"))
@@ -541,6 +541,7 @@ def base_ruleset() -> dict:
         "income": income,
         "eligibility": ELIGIBILITY,
         "dtaa": DTAA,
+        "home_country": HOME_COUNTRY,
         "structuring": STRUCTURING,
         "categories": CATEGORIES,
         "stt": STT,

@@ -511,6 +511,21 @@ def compute_tax(rules: dict, payload: dict) -> dict:
         notes.append(f"Treaty country: {country['name']}. Needs TRC + Form 10F. Capital gains on shares: {country['cg_shares']}")
         if country.get("mf_units_residence_only") and not payload.get("apply_mf_treaty"):
             notes.append(f"{country['name']} residents may claim MF-unit gains as not taxable in India (tribunal view) — switch on to see the effect.")
+    home = payload.get("home_country") or (payload.get("dtaa_country") if country else None)
+    if payload.get("us_person") or entity in ("us_person_in_india", "us_person_nri"):
+        home = "us"
+    if home and rules.get("home_country"):
+        pooled = {"equity_mf", "debt_mf_post_apr2023", "debt_mf_pre_apr2023", "other_mf", "commodity_intl_etf",
+                  "gift_city_fund", "aif_units", "sif", "ulip_high_premium"}
+        if any(l["asset_used"] in pooled or l.get("asset_used") == "sif" for l in lines) or \
+                any(g.get("asset_id") in pooled for g in payload.get("gains", [])):
+            hc = rules["home_country"]
+            msg = {"us": "US person: these Indian funds are PFICs — Form 8621 each year; default US regime taxes gains at top ordinary rates plus interest. Direct shares / PMS avoid PFIC.",
+                   "uk": "UK resident: Indian funds are non-reporting offshore funds — gains taxed as income in the UK, not CGT. Direct shares / PMS get CGT treatment.",
+                   "canada": "Canada resident: Indian funds are foreign property (T1135 above C$100k); foreign-trust rules may impute income.",
+                   "australia": "Australia resident: ordinary CGT generally, but check foreign-trust distribution rules."}.get(home)
+            if msg:
+                notes.append("Home-country tax: " + msg)
     if vda_losses_ignored:
         notes.append(f"VDA losses of ₹{vda_losses_ignored:,.0f} ignored (no set-off allowed).")
     if any(l["asset_used"] == "real_estate" for l in lines) and entity in ("individual_resident", "huf"):
