@@ -134,6 +134,8 @@ def _asset(rules, asset_id):
 
 
 # ------------------------------------------------------------------ classification
+MF_UNIT_ASSETS = {"equity_mf", "debt_mf_post_apr2023", "debt_mf_pre_apr2023", "other_mf", "commodity_intl_etf"}
+
 SIF_MAP = {"equity": "equity_mf", "debt": "debt_mf_post_apr2023", "hybrid": "other_mf"}
 
 
@@ -322,6 +324,18 @@ def compute_tax(rules: dict, payload: dict) -> dict:
                 "ruleset_version": rules.get("version")}
     normal = float(payload.get("normal_income") or 0)
     dividend = min(float(payload.get("dividend_income") or 0), max(normal, 0))
+    eng_id = _resolve_engine(rules, entity)[0]
+    nonresident = eng_id in ("individual_nri", "huf_nonresident")
+    country = None
+    if payload.get("dtaa_country") and (nonresident or prof["kind"] == "fpi"):
+        country = next((c for c in rules.get("dtaa", {}).get("countries", []) if c["id"] == payload["dtaa_country"]), None)
+    nr_dividend = 0.0
+    nr_div_rate = 0.0
+    if nonresident and dividend > 0:
+        act = float(rules.get("dtaa", {}).get("act_rates_nonresident", {}).get("dividend", 20))
+        treaty = float(country["dividend"]["individual_effective"]) if country else act
+        nr_div_rate = min(act, treaty)
+        nr_dividend, normal, dividend = dividend, normal - dividend, 0.0
     exemption_112A = float(rules["capital_gains"]["common"].get("ltcg_112A_exemption", 125000))
     notes: List[str] = []
 
@@ -333,6 +347,10 @@ def compute_tax(rules: dict, payload: dict) -> dict:
                           held_to_maturity=g.get("held_to_maturity", False), sif_class=g.get("sif_class", ""),
                           ulip_equity=g.get("ulip_equity", True), promoter=g.get("promoter", ""),
                           entity="individual" if _resolve_engine(rules, entity)[0] in ("individual_resident", "individual_nri") else entity)
+        if country and country.get("mf_units_residence_only") and payload.get("apply_mf_treaty") \
+                and c["asset_used"] in MF_UNIT_ASSETS and not c["exempt"]:
+            c = {**c, "exempt": True, "setoff": False,
+                 "reason": f"{country['name']} DTAA residuary clause (tribunal view): MF-unit gains taxable only in the country of residence."}
         lines.append({**c, "gain": float(g.get("gain") or 0), "label": g.get("label") or g["asset_id"]})
 
     # 2. bucket: key = (term, rate, pool)
@@ -420,9 +438,9 @@ def compute_tax(rules: dict, payload: dict) -> dict:
         notes.append("FPI: interest/dividend at 20%, non-equity short-term gains at 30% (115AD); DTAA may lower.")
     else:
         tax_normal = normal_total * prof["rate"] / 100
-    tax_special_cg = sum(v * float(k[1]) / 100 for k, v in special.items() if k[3] != "vda")
+    tax_special_cg = sum(v * float(k[1]) / 100 for k, v in special.items() if k[3] != "vda") + nr_dividend * nr_div_rate / 100
     tax_vda = sum(v * float(k[1]) / 100 for k, v in special.items() if k[3] == "vda")
-    special_income = sum(v for k, v in special.items())
+    special_income = sum(v for k, v in special.items()) + nr_dividend
     total_income = normal_total + special_income
 
     # 8. rebate (resident individual)
@@ -487,6 +505,12 @@ def compute_tax(rules: dict, payload: dict) -> dict:
         notes.append("MAT at 14% of book profit (final tax) may apply — not computed here.")
     if dividend:
         notes.append("Surcharge cap on dividends computed on a pro-rata share of normal tax.")
+    if nr_dividend:
+        notes.append(f"Non-resident dividends taxed at {nr_div_rate:g}%" + (f" ({country['name']} treaty vs Act 20%, lower applies)." if country else " under the Act."))
+    if country:
+        notes.append(f"Treaty country: {country['name']}. Needs TRC + Form 10F. Capital gains on shares: {country['cg_shares']}")
+        if country.get("mf_units_residence_only") and not payload.get("apply_mf_treaty"):
+            notes.append(f"{country['name']} residents may claim MF-unit gains as not taxable in India (tribunal view) — switch on to see the effect.")
     if vda_losses_ignored:
         notes.append(f"VDA losses of ₹{vda_losses_ignored:,.0f} ignored (no set-off allowed).")
     if any(l["asset_used"] == "real_estate" for l in lines) and entity in ("individual_resident", "huf"):
