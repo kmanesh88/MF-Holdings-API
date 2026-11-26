@@ -50,7 +50,8 @@ TAG_MODEL = os.environ.get("CAPTURE_TAG_MODEL", "claude-sonnet-5-5")
 MAX_SECONDS = 2 * 60 * 60          # Sarvam batch limit per file
 TAG_CHUNK = 40                     # utterances per Claude call
 CHANNELS = {"in_person", "phone", "video"}
-ROLES = {"advisor", "client", "other"}
+ROLES = {"advisor", "client", "colleague", "other"}
+CONVERSATION_TYPES = {"client", "team"}
 PROCESSING = {"uploaded", "transcribing", "tagging"}
 
 INTENTS: Dict[str, str] = {
@@ -62,7 +63,10 @@ INTENTS: Dict[str, str] = {
     "compare_safe_assets":   "Compares with FD, gold, real estate, insurance, other 'safe' options",
     "new_investment":        "Has money to invest / wants to add",
     "product_inquiry":       "Asks about a specific product (PMS, AIF, SIF, NFO, stock, bond, NPS)",
-    "tax_query":             "Tax on gains, ELSS, LTCG / STCG, tax harvesting",
+    "tax_query":             "General tax question: how much tax, slab, regime, ELSS / 80C",
+    "tax_harvesting":        "Booking gains/losses for tax: ₹1.25 lakh harvesting, set-off, timing a redemption",
+    "tax_crossborder":       "NRI / OCI / returning NRI / DTAA / TDS / US-UK home-country tax (PFIC etc.)",
+    "tax_structure":         "Which entity should hold it: HUF, trust, LLP, company, gifting, clubbing",
     "goal_planning":         "Talks about goals: education, retirement, house, marriage",
     "liquidity_need":        "Upcoming need for cash / emergency",
     "risk_appetite":         "States how much risk they can or can't take",
@@ -75,6 +79,16 @@ INTENTS: Dict[str, str] = {
     "advisor_turn":          "Said by the advisor",
     "other":                 "Nothing above fits",
 }
+# Intent → Fluid cards that should appear (lets the dataset score and train Fluid's triggers)
+FLUID_CARDS = {
+    "stop_sip_pause": ["f_bear_market", "f_sip_lumpsum"], "market_fear": ["f_bear_market", "f_market_valuation"],
+    "redeem_withdraw": ["f_bear_market", "f_tax_calc"], "return_dissatisfaction": ["f_bear_market"],
+    "compare_safe_assets": ["f_inflation", "f_asset_class", "f_tax_debt"],
+    "tax_query": ["f_tax_equity", "f_tax_changes"], "tax_harvesting": ["f_tax_harvest", "f_tax_equity"],
+    "tax_crossborder": ["f_tax_nri", "f_tax_dtaa", "f_tax_home", "f_tax_residency"],
+    "tax_structure": ["f_tax_entity", "f_tax_planning"], "fees_costs": [], "third_party_opinion": [],
+}
+
 EMOTIONS = ["calm", "curious", "anxious", "frustrated", "skeptical", "excited", "confused"]
 
 # Up to 50 keyterms (Sarvam limit), client-specific fund names first.
@@ -332,8 +346,12 @@ def _parse_json(text: str) -> dict:
         raise
 
 
-def _tag_chunk(client, chunk, ctx) -> dict:
+def _tag_chunk(client, chunk, ctx, conversation_type="client") -> dict:
     lines = []
+    if conversation_type == "team":
+        lines.append("This is an internal TEAM conversation: a senior advisor with relationship managers discussing clients. "
+                     "Treat the person explaining / answering as the advisor (intent advisor_turn); tag questions and client "
+                     "situations raised by the other speakers with the intent they describe.\n")
     if ctx:
         lines.append("Context (do not annotate):")
         lines += [f"[speaker {u['speaker_id']}] {u['text_codemix']}" for u in ctx]
@@ -352,15 +370,16 @@ def tag_session(ref):
     docs = sorted((d.to_dict() for d in ref.collection("utterances").stream()), key=lambda u: u["i"])
     if not docs:
         return
+    ctype = (ref.get().to_dict() or {}).get("conversation_type", "client")
     votes: Dict[str, int] = {}
     for start in range(0, len(docs), TAG_CHUNK):
         chunk = docs[start:start + TAG_CHUNK]
         ctx = docs[max(0, start - 6):start]
         try:
-            result = _tag_chunk(client, chunk, ctx)
+            result = _tag_chunk(client, chunk, ctx, ctype)
         except Exception:  # one retry, then give up on this chunk only
             log.warning("tag chunk %s failed, retrying", start)
-            result = _tag_chunk(client, chunk, ctx)
+            result = _tag_chunk(client, chunk, ctx, ctype)
         adv = str(result.get("advisor_speaker", ""))
         if adv:
             votes[adv] = votes.get(adv, 0) + len(chunk)
@@ -387,7 +406,8 @@ def tag_session(ref):
     if session.get("speaker_map_source") != "human":
         speakers = sorted({u["speaker_id"] for u in docs})
         advisor = max(votes, key=votes.get) if votes else speakers[0]
-        ref.update({"speaker_map": {sp: ("advisor" if sp == advisor else "client") for sp in speakers},
+        other = "colleague" if ctype == "team" else "client"
+        ref.update({"speaker_map": {sp: ("advisor" if sp == advisor else other) for sp in speakers},
                     "speaker_map_source": "ai"})
 
 
@@ -406,6 +426,7 @@ async def create_session(bg: BackgroundTasks,
                          num_speakers: int = Form(2),
                          recorded_at: str = Form(""),
                          source: str = Form("recorded"),
+                         conversation_type: str = Form("client"),
                          uid: str = Depends(current_advisor)):
     if channel not in CHANNELS:
         raise HTTPException(400, f"channel must be one of {sorted(CHANNELS)}")
@@ -435,6 +456,7 @@ async def create_session(bg: BackgroundTasks,
         "advisor_id": uid,
         "client_id": client_id.strip() or None,
         "channel": channel,
+        "conversation_type": conversation_type if conversation_type in CONVERSATION_TYPES else "client",
         "source": source if source in {"recorded", "uploaded"} else "recorded",
         "language_hint": language_hint or None,
         "detected_language": None,
@@ -547,7 +569,7 @@ def confirm_remaining(sid: str, uid: str = Depends(current_advisor)):
     b, n, total = db().batch(), 0, 0
     for snap in ref.collection("utterances").where("reviewed", "==", False).stream():
         u = snap.to_dict()
-        if smap.get(u["speaker_id"]) != "client" or not u.get("ai_tags"):
+        if smap.get(u["speaker_id"]) not in ("client", "colleague") or not u.get("ai_tags"):
             continue
         b.update(snap.reference, {"reviewed": True, "human_tags": {
             **u["ai_tags"], "custom_intent": False, "note": None, "reviewed_by": uid,
@@ -597,7 +619,7 @@ def _client_rows(uid: str, reviewed_only: bool):
             if role == "advisor":
                 last_advisor = u.get("text_en_human") or u.get("text_en") or u["text_codemix"]
                 continue
-            if role != "client" or (reviewed_only and not u.get("reviewed")):
+            if role not in ("client", "colleague") or (reviewed_only and not u.get("reviewed")):
                 continue
             tags = u.get("human_tags") or u.get("ai_tags") or {}
             yield {
@@ -605,10 +627,13 @@ def _client_rows(uid: str, reviewed_only: bool):
                 "utterance": u["i"],
                 "client_id": d.get("client_id"),
                 "channel": d.get("channel"),
+                "conversation_type": d.get("conversation_type", "client"),
+                "speaker_role": role,
                 "language": d.get("detected_language") or d.get("language_hint"),
                 "text_codemix": u["text_codemix"],
                 "text_en": u.get("text_en_human") or u.get("text_en"),
                 "intent": tags.get("intent"),
+                "expected_fluid_cards": FLUID_CARDS.get(tags.get("intent"), []),
                 "emotion": tags.get("emotion"),
                 "intensity": tags.get("intensity"),
                 "entities": tags.get("entities") or [],
