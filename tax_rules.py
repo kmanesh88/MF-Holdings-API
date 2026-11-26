@@ -16,7 +16,7 @@ need a code deploy. Every block carries:
 Amounts in INR. Rates in percent.
 """
 
-BASE_VERSION = "2026.11.26-base"
+BASE_VERSION = "2026.11.26b-base"
 
 META = {
     "jurisdiction": "India",
@@ -227,7 +227,7 @@ ENTITIES = {
         "verified": False, "src": [],
     },
     "firm_llp": {
-        "label": "Partnership firm / LLP",
+        "label": "Firm / LLP — general rules",
         "base": "flat", "rate": 30, "surcharge": "firm_llp",
         "rules": ["Flat 30% on normal income; capital gains at their special rates.",
                   "Surcharge 12% above ₹1 crore (no 15% cap on capital gains).",
@@ -237,7 +237,7 @@ ENTITIES = {
         "verified": True, "src": ["aaptax_firm"],
     },
     "company_domestic": {
-        "label": "Domestic company",
+        "label": "Domestic company — rate options",
         "options": [
             {"id": "115BAA", "rate": 22, "surcharge": "domestic_company_115BAA_BAB", "mat": False,
              "effective_max": 25.168, "note": "No specified deductions/incentives."},
@@ -497,19 +497,54 @@ CHANGES_2026 = [
 ]
 
 
+ENTITY_GROUP = {
+    "individual_resident": "Individuals", "individual_nri": "Individuals", "huf": "Family structures",
+    "aop_boi": "AOP / BOI / others", "trust_private_specific": "Trusts", "trust_private_discretionary": "Trusts",
+    "trust_charitable": "Charitable", "firm_llp": "Firms & LLPs", "company_domestic": "Companies",
+    "company_foreign": "Companies", "cooperative_society": "AOP / BOI / others",
+}
+ENTITY_ENGINE = {
+    "individual_resident": "individual_resident", "individual_nri": "individual_nri", "huf": "huf",
+    "aop_boi": "aop_boi", "trust_private_specific": None, "trust_private_discretionary": "trust_private_discretionary",
+    "trust_charitable": "charitable", "firm_llp": "firm_llp", "company_domestic": "company",
+    "company_foreign": "company_foreign", "cooperative_society": "cooperative",
+}
+
+
 def base_ruleset() -> dict:
+    import copy
+    from tax_rules_ext import (SOURCES_EXT, RESIDENCY, PERSONS, EXTRA_ASSETS, ASSET_CATEGORY, EXTRA_INCOME,
+                               INCOME_CATEGORY, ELIGIBILITY, STRUCTURING, CATEGORIES)
+    entities = copy.deepcopy(ENTITIES)
+    for k, e in entities.items():
+        e.setdefault("group", ENTITY_GROUP.get(k, "Other"))
+        e.setdefault("engine", ENTITY_ENGINE.get(k))
+    entities.update(copy.deepcopy(PERSONS))
+    cg = copy.deepcopy(CAPITAL_GAINS)
+    for a in cg["assets"]:
+        a.setdefault("cat", ASSET_CATEGORY.get(a["id"], "Other"))
+    cg["assets"].extend(copy.deepcopy(EXTRA_ASSETS))
+    income = copy.deepcopy(INCOME)
+    for i in income:
+        i.setdefault("cat", INCOME_CATEGORY.get(i["id"], "Other"))
+    income.extend(copy.deepcopy(EXTRA_INCOME))
     return {
         "version": BASE_VERSION,
         "meta": META,
-        "sources": SOURCES,
+        "sources": {**SOURCES, **SOURCES_EXT},
+        "residency": RESIDENCY,
         "slabs": SLABS,
         "surcharge": SURCHARGE,
-        "entities": ENTITIES,
+        "entities": entities,
         "mmr": MMR,
-        "capital_gains": CAPITAL_GAINS,
-        "income": INCOME,
+        "capital_gains": cg,
+        "income": income,
+        "eligibility": ELIGIBILITY,
+        "structuring": STRUCTURING,
+        "categories": CATEGORIES,
         "stt": STT,
         "set_off": SET_OFF,
         "tds": TDS,
         "changes_2026": CHANGES_2026,
     }
+

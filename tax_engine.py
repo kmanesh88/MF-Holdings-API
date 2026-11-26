@@ -166,10 +166,15 @@ def classify_gain(rules: dict, asset_id: str, purchase_date, sale_date, *, liste
 
     a = _asset(rules, aid)
 
-    if aid == "vda":
-        return {"term": "flat", "rate": a.get("flat", 30), "pool_112A": False, "setoff": False, "exempt": False,
-                "asset_used": aid, "months": held, "lt_threshold": None,
-                "reason": "VDA: flat rate, no set-off of losses."}
+    if a.get("flat") is not None:
+        return {"term": "flat", "rate": a["flat"], "pool_112A": False, "setoff": False, "exempt": False,
+                "asset_used": aid, "months": held, "lt_threshold": None, "vda": True,
+                "reason": f"{a['label']}: flat {a['flat']}%, no set-off of losses."}
+    if a.get("exempt_all"):
+        return {"term": "LT", "rate": 0, "pool_112A": False, "setoff": False, "exempt": True,
+                "asset_used": aid, "months": held, "lt_threshold": None, "reason": f"{a['label']}: exempt."}
+    if "stcg" not in a:
+        raise ValueError(f"'{a['label']}' is taxed by its underlying holdings — pick the underlying asset instead.")
 
     if aid == "sgb" and original_subscriber and held_to_maturity and entity.startswith("individual"):
         return {"term": "LT", "rate": 0, "pool_112A": False, "setoff": False, "exempt": True,
@@ -204,36 +209,66 @@ COMPANY_OPTIONS = {"company_115BAA": "115BAA", "company_115BAB": "115BAB",
                    "company_normal_small": "normal_small", "company_normal": "normal"}
 
 
-def _profile(rules, entity, regime, age_band):
+def _resolve_engine(rules, entity):
+    e = rules["entities"].get(entity)
+    if entity in SLAB_ENTITIES | MMR_ENTITIES | {"firm_llp", "company_foreign"} | set(COMPANY_OPTIONS):
+        return entity, (e or {}).get("label", entity)
+    if e is None:
+        raise ValueError(f"Unknown entity '{entity}'")
+    eng = e.get("engine")
+    if eng is None:
+        raise ValueError(f"{e['label']}: not taxed directly — tax arises in the hands of its investors / beneficiaries.")
+    return eng, e["label"]
+
+
+def _profile(rules, entity, regime, age_band, company_regime="115BAA", coop_regime="normal"):
     ent = rules["entities"]
-    if entity in SLAB_ENTITIES:
+    eng, label = _resolve_engine(rules, entity)
+    if eng == "aop_determinate_like":
+        eng = "aop_boi"
+    if eng in SLAB_ENTITIES or eng in ("huf_nonresident", "ajp"):
         reg = regime if regime in ("new_regime", "old_regime") else "new_regime"
         if reg == "new_regime":
             slabs = rules["slabs"]["new_regime"]["slabs"]
         else:
-            band = age_band if (entity == "individual_resident" and age_band in ("senior_60_79", "super_senior_80")) else "below_60"
+            band = age_band if (eng == "individual_resident" and age_band in ("senior_60_79", "super_senior_80")) else "below_60"
             slabs = rules["slabs"]["old_regime"]["slabs"][band]
         return {"kind": "slab", "slabs": slabs, "regime": reg, "surcharge": rules["surcharge"]["individual_like"],
-                "rebate": rules["slabs"][reg]["rebate"] if entity == "individual_resident" else None,
-                "shortfall": entity in ("individual_resident", "huf"),
-                "label": ent.get(entity if entity != "aop_boi" else "aop_boi", {}).get("label", entity)}
-    if entity in MMR_ENTITIES:
+                "rebate": rules["slabs"][reg]["rebate"] if eng == "individual_resident" else None,
+                "shortfall": eng in ("individual_resident", "huf"), "label": label}
+    if eng in MMR_ENTITIES:
         return {"kind": "flat", "rate": 30, "regime": "mmr", "surcharge": rules["surcharge"]["individual_like"],
-                "rebate": None, "shortfall": False,
-                "label": "Private discretionary trust (MMR)" if entity.startswith("trust") else "AOP/BOI at MMR"}
-    if entity == "firm_llp":
+                "rebate": None, "shortfall": False, "label": label}
+    if eng == "firm_llp":
         return {"kind": "flat", "rate": ent["firm_llp"]["rate"], "regime": "flat",
                 "surcharge": rules["surcharge"]["firm_llp"], "rebate": None, "shortfall": False,
-                "label": ent["firm_llp"]["label"], "no_special_cap": True}
-    if entity in COMPANY_OPTIONS:
-        opt = next(o for o in ent["company_domestic"]["options"] if o["id"] == COMPANY_OPTIONS[entity])
+                "label": label, "no_special_cap": True}
+    if eng in COMPANY_OPTIONS or eng == "company":
+        oid = COMPANY_OPTIONS.get(eng) or {"115BAA": "115BAA", "115BAB": "115BAB", "normal_small": "normal_small",
+                                           "normal": "normal"}.get(company_regime, "115BAA")
+        opt = next(o for o in ent["company_domestic"]["options"] if o["id"] == oid)
         return {"kind": "flat", "rate": opt["rate"], "regime": opt["id"],
                 "surcharge": rules["surcharge"][opt["surcharge"]], "rebate": None, "shortfall": False,
-                "label": f"Domestic company ({opt['id']})", "no_special_cap": True}
-    if entity == "company_foreign":
+                "label": f"{label} — {opt['id']}" if eng == "company" else f"Domestic company ({opt['id']})", "no_special_cap": True}
+    if eng == "company_foreign":
         return {"kind": "flat", "rate": ent["company_foreign"]["rate"], "regime": "flat",
                 "surcharge": rules["surcharge"]["foreign_company"], "rebate": None, "shortfall": False,
-                "label": ent["company_foreign"]["label"], "no_special_cap": True}
+                "label": label, "no_special_cap": True}
+    if eng in ("fpi_corporate", "fpi_non_corporate"):
+        return {"kind": "fpi", "rate": 20, "slab_gain_rate": 30, "regime": "115AD",
+                "surcharge": rules["surcharge"]["foreign_company" if eng == "fpi_corporate" else "individual_like"],
+                "rebate": None, "shortfall": False, "label": label, "no_special_cap": eng == "fpi_corporate"}
+    if eng == "cooperative":
+        opts = ent["cooperative_society"]["options"]
+        if coop_regime in ("115BAD", "115BAE"):
+            opt = next(o for o in opts if o["id"] == coop_regime)
+            return {"kind": "flat", "rate": opt["rate"], "regime": coop_regime, "surcharge": rules["surcharge"][opt["surcharge"]],
+                    "rebate": None, "shortfall": False, "label": label, "no_special_cap": True}
+        opt = next(o for o in opts if o["id"] == "normal")
+        return {"kind": "slab", "slabs": opt["slabs"], "regime": "normal", "surcharge": rules["surcharge"][opt["surcharge"]],
+                "rebate": None, "shortfall": False, "label": label, "no_special_cap": True}
+    if eng == "charitable":
+        return {"kind": "exempt", "regime": "exempt", "label": label}
     raise ValueError(f"Unknown entity '{entity}'")
 
 
@@ -273,7 +308,18 @@ def compute_tax(rules: dict, payload: dict) -> dict:
     }
     """
     entity = payload.get("entity", "individual_resident")
-    prof = _profile(rules, entity, payload.get("regime", "new_regime"), payload.get("age_band", "below_60"))
+    prof = _profile(rules, entity, payload.get("regime", "new_regime"), payload.get("age_band", "below_60"),
+                    payload.get("company_regime", "115BAA"), payload.get("coop_regime", "normal"))
+    if prof["kind"] == "exempt":
+        return {"entity": entity, "entity_label": prof["label"], "regime": "exempt", "lines": [], "set_off": [],
+                "carry_forward": {"stcl": 0, "ltcl": 0}, "exemption_112A_used": 0, "basic_exemption_used_vs_cg": 0,
+                "exempt_gains": 0, "income": {"normal_incl_slab_gains": 0, "special_rate_gains": 0, "total_taxable": 0},
+                "tax": {"normal": 0, "special_cg": 0, "vda": 0, "rebate": 0, "surcharge_rate": 0, "surcharge": 0,
+                        "marginal_relief": 0, "cess": 0, "total": 0},
+                "tax_on_gains_only": 0, "effective_rate_pct": 0.0,
+                "notes": ["Exempt entity: income is exempt if registered and applied to objects / per its exemption; "
+                          "violations or non-specified investments can make income taxable at MMR."],
+                "ruleset_version": rules.get("version")}
     normal = float(payload.get("normal_income") or 0)
     dividend = min(float(payload.get("dividend_income") or 0), max(normal, 0))
     exemption_112A = float(rules["capital_gains"]["common"].get("ltcg_112A_exemption", 125000))
@@ -285,12 +331,13 @@ def compute_tax(rules: dict, payload: dict) -> dict:
         c = classify_gain(rules, g["asset_id"], g["purchase_date"], g["sale_date"], listed=g.get("listed"),
                           original_subscriber=g.get("original_subscriber", False),
                           held_to_maturity=g.get("held_to_maturity", False), sif_class=g.get("sif_class", ""),
-                          ulip_equity=g.get("ulip_equity", True), promoter=g.get("promoter", ""), entity=entity)
+                          ulip_equity=g.get("ulip_equity", True), promoter=g.get("promoter", ""),
+                          entity="individual" if _resolve_engine(rules, entity)[0] in ("individual_resident", "individual_nri") else entity)
         lines.append({**c, "gain": float(g.get("gain") or 0), "label": g.get("label") or g["asset_id"]})
 
     # 2. bucket: key = (term, rate, pool)
     def key(l):
-        return (l["term"], str(l["rate"]), l["pool_112A"], "vda" if l["asset_used"] == "vda" else "cg")
+        return (l["term"], str(l["rate"]), l["pool_112A"], "vda" if l.get("vda") else "cg")
     buckets: Dict[tuple, float] = {}
     exempt_total = 0.0
     vda_losses_ignored = 0.0
@@ -305,7 +352,7 @@ def compute_tax(rules: dict, payload: dict) -> dict:
 
     # 3. set-off within and across buckets
     slabs = prof.get("slabs")
-    marg = (marginal_slab_rate(normal, slabs) if slabs else prof.get("rate", 30))
+    marg = (marginal_slab_rate(normal, slabs) if slabs else prof.get("slab_gain_rate", prof.get("rate", 30)))
 
     def eff_rate(k):
         r = k[1]
@@ -368,6 +415,9 @@ def compute_tax(rules: dict, payload: dict) -> dict:
     # 7. tax components
     if prof["kind"] == "slab":
         tax_normal = slab_tax(normal_total, slabs)
+    elif prof["kind"] == "fpi":
+        tax_normal = normal * prof["rate"] / 100 + slab_gains * prof["slab_gain_rate"] / 100
+        notes.append("FPI: interest/dividend at 20%, non-equity short-term gains at 30% (115AD); DTAA may lower.")
     else:
         tax_normal = normal_total * prof["rate"] / 100
     tax_special_cg = sum(v * float(k[1]) / 100 for k, v in special.items() if k[3] != "vda")
@@ -417,6 +467,8 @@ def compute_tax(rules: dict, payload: dict) -> dict:
         excess = total_income - t
         if prof["kind"] == "slab":
             tax_at_t = slab_tax(max(0.0, normal_total - excess), slabs) + tax_special_cg + tax_vda
+        elif prof["kind"] == "fpi":
+            tax_at_t = max(0.0, tax_normal - excess * prof["rate"] / 100) + tax_special_cg + tax_vda
         else:
             tax_at_t = max(0.0, normal_total - excess) * prof["rate"] / 100 + tax_special_cg + tax_vda
         ceiling = tax_at_t * (1 + lower_rate / 100) + excess
@@ -431,7 +483,7 @@ def compute_tax(rules: dict, payload: dict) -> dict:
     # notes
     if entity == "trust_private_discretionary":
         notes.append(rules["entities"]["trust_private_discretionary"]["open_question"])
-    if entity.startswith("company") and entity not in ("company_115BAA", "company_115BAB"):
+    if prof["regime"] in ("normal", "normal_small") and "ompany" in prof["label"]:
         notes.append("MAT at 14% of book profit (final tax) may apply — not computed here.")
     if dividend:
         notes.append("Surcharge cap on dividends computed on a pro-rata share of normal tax.")

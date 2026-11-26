@@ -328,7 +328,7 @@ def _call_agent(prompt: str) -> str:
     import anthropic
     client = anthropic.Anthropic()
     messages = [{"role": "user", "content": prompt}]
-    tools = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 20}]
+    tools = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 30}]
     text = ""
     for _ in range(6):   # continue through pause_turn
         resp = client.messages.create(model=AGENT_MODEL, max_tokens=16000, system=AGENT_SYSTEM,
@@ -374,7 +374,7 @@ def run_agent(run_id: str, mode: str = "all"):
         if mode in ("all", "changes"):
             task.append(f"CHANGES: find enacted or proposed changes since {since} (today is {dt.date.today()}).")
         if mode in ("all", "verify"):
-            task.append("VERIFY these unverified blocks (up to 12 this run, most investor-relevant first):\n"
+            task.append("VERIFY these unverified blocks (up to 25 this run, most investor-relevant first; skip ones verified in earlier runs):\n"
                         + "\n".join(f"- {u}" for u in unverified))
         prompt = (f"Ruleset version {r['version']} for tax year {r['meta']['tax_year']}.\n\n"
                   + "\n\n".join(task) + "\n\nRULESET LISTING (path = value):\n" + listing)

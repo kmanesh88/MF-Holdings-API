@@ -1,0 +1,433 @@
+"""
+Vantage · Fluid Tax — extended coverage (merged into the base ruleset by tax_rules.base_ruleset()).
+
+Adds:
+  RESIDENCY      residential-status tests, scope of income, citizenship vs residency
+  PERSONS        every investor type / legal structure (extends ENTITIES)
+  EXTRA_ASSETS   remaining capital assets available to Indian investors
+  EXTRA_INCOME   remaining income-type instruments (deposits, small savings, pensions, foreign deposits ...)
+  ELIGIBILITY    who may invest in what (FEMA / scheme rules) — affects advice before tax does
+  STRUCTURING    tax-efficiency playbook: HUF, trusts, gifting, clubbing, LLP vs company, RNOR window
+  CATEGORIES     display grouping for assets / income items
+
+New blocks are marked verified=False unless backed by a cited source, so the update agent verifies them.
+"""
+
+SOURCES_EXT = {
+    "itd_residency": {"title": "Residential status — Income Tax Department",
+                      "url": "https://www.incometaxindia.gov.in/w/residential-status"},
+    "itd_fpi": {"title": "Taxation of FPIs — Income Tax Department",
+                "url": "https://www.incometaxindia.gov.in/"},
+}
+
+# --------------------------------------------------------------------------- residency
+RESIDENCY = {
+    "principle": "Indian income tax depends on residential status for the tax year, not citizenship. "
+                 "Citizenship only changes which residency tests apply.",
+    "tests": [
+        {"id": "resident_182", "rule": "In India 182 days or more in the tax year → resident."},
+        {"id": "resident_60_365", "rule": "In India 60 days or more in the tax year AND 365 days or more in the 4 preceding years → resident."},
+        {"id": "citizen_pio_visiting", "rule": "Indian citizen / PIO visiting India: the 60-day test becomes 120 days if Indian income (other than foreign sources) exceeds ₹15 lakh; otherwise 182 days."},
+        {"id": "citizen_leaving_employment", "rule": "Indian citizen leaving India for employment abroad or as ship crew: 60-day test replaced by 182 days."},
+        {"id": "deemed_resident", "rule": "Indian citizen with Indian income above ₹15 lakh who is not liable to tax in any other country (by domicile/residence) → deemed resident, treated as RNOR."},
+    ],
+    "statuses": {
+        "ROR": {"label": "Resident and ordinarily resident", "scope": "Global income taxable in India; foreign assets reported in Schedule FA; foreign tax credit under DTAA / unilateral relief."},
+        "RNOR": {"label": "Resident but not ordinarily resident",
+                 "conditions": "Resident, and either non-resident in 9 of the 10 preceding years, or in India 729 days or less in the 7 preceding years; also via the 120-day rule and deemed-resident rule.",
+                 "scope": "Indian income taxable; foreign income NOT taxable unless derived from a business controlled / profession set up in India. Typically 2–3 years for a returning NRI."},
+        "NR": {"label": "Non-resident", "scope": "Only income received / accruing / deemed to accrue in India. Foreign income outside the net."},
+    },
+    "huf_residency": "HUF is resident if control and management is wholly or partly in India; RNOR if the karta is RNOR.",
+    "company_residency": "Indian company always resident; foreign company resident if its place of effective management (POEM) is in India.",
+    "firm_aop_residency": "Firm / LLP / AOP resident unless control and management is wholly outside India.",
+    "citizenship_types": {
+        "indian_citizen": "Residency tests above; can be NRI when abroad.",
+        "oci_pio": "Overseas Citizen of India / Person of Indian Origin — taxed purely by residency; for FEMA treated like NRIs for most investments.",
+        "foreign_national": "Taxed by residency like anyone else; if non-resident usually invests via FPI route; if resident (e.g. expat working in India) taxed as resident, often RNOR in early years.",
+    },
+    "verified": False, "src": [],
+}
+
+# --------------------------------------------------------------------------- persons / structures
+# Each maps to an engine profile via "engine" so the calculator supports it.
+PERSONS = {
+    # ---------------- individuals by residency / citizenship
+    "individual_rnor": {
+        "label": "Individual — RNOR (returning NRI / new expat)", "group": "Individuals", "engine": "individual_resident",
+        "rules": ["Same rates, rebate and exemptions as a resident on Indian income.",
+                  "Foreign income (foreign salary, foreign interest, gains on foreign assets) not taxable unless from a business controlled in India.",
+                  "RNOR years are the window to restructure foreign holdings before they become taxable as ROR."],
+        "verified": False, "src": [],
+    },
+    "oci_nonresident": {
+        "label": "OCI / PIO — non-resident", "group": "Individuals", "engine": "individual_nri",
+        "rules": ["Taxed exactly like an NRI (residency decides tax).",
+                  "FEMA: may invest in Indian MFs, shares (via PIS for secondary market), NPS, NRE/NRO accounts; new PPF accounts not allowed.",
+                  "US/Canada-resident investors: many AMCs restrict fresh MF investments (FATCA); US tax may treat Indian MFs as PFICs."],
+        "verified": False, "src": [],
+    },
+    "foreign_national_resident": {
+        "label": "Foreign national — resident in India (expat)", "group": "Individuals", "engine": "individual_resident",
+        "rules": ["Taxed as resident: ROR on global income, or RNOR in initial years.",
+                  "DTAA with home country decides tie-breaker residency and foreign tax credit.",
+                  "Short-stay employee exemption may apply for certain foreign-employer salaries (≤90 days)."],
+        "verified": False, "src": [],
+    },
+    "foreign_national_nonresident": {
+        "label": "Foreign national — non-resident", "group": "Individuals", "engine": "individual_nri",
+        "rules": ["Taxed only on Indian-source income at NRI rates; DTAA can lower rates on dividends / interest / some gains.",
+                  "FEMA: generally cannot invest in Indian MFs directly; usual route is as / through an FPI. Some AMCs accept residents of certain countries."],
+        "verified": False, "src": [],
+    },
+    "minor": {
+        "label": "Minor child", "group": "Individuals", "engine": "individual_resident",
+        "rules": ["Minor's income is clubbed with the parent having higher income (except income from the minor's own skill / manual work, or a disabled minor).",
+                  "Old regime: ₹1,500 exemption per child on clubbed income.",
+                  "On turning 18, income is the child's own — investments in the child's name start getting their own slabs and ₹1.25 lakh exemption."],
+        "verified": False, "src": [],
+    },
+    "senior_citizen": {
+        "label": "Senior / super-senior citizen (resident)", "group": "Individuals", "engine": "individual_resident",
+        "rules": ["Old regime: nil slab ₹3 lakh (60–79) / ₹5 lakh (80+); 80TTB ₹50,000 on interest; 80D ₹50,000.",
+                  "New regime: no separate senior slabs.",
+                  "No advance tax if no business income.",
+                  "75+ with only pension and interest from the same bank: bank deducts tax and return filing is not required."],
+        "verified": False, "src": [],
+    },
+    "sole_proprietor": {
+        "label": "Sole proprietorship", "group": "Individuals", "engine": "individual_resident",
+        "rules": ["Not a separate taxpayer — business income is the owner's income at slab rates.",
+                  "Presumptive schemes (44AD 6%/8%, 44ADA 50%) for small businesses / professionals."],
+        "verified": False, "src": [],
+    },
+    "huf_nonresident": {
+        "label": "HUF — non-resident", "group": "Family structures", "engine": "huf_nonresident",
+        "rules": ["Control and management wholly outside India.", "Indian income at slab rates; no basic-exemption offset against equity gains."],
+        "verified": False, "src": [],
+    },
+    # ---------------- firms and companies
+    "partnership_firm": {
+        "label": "Partnership firm (registered / unregistered)", "group": "Firms & LLPs", "engine": "firm_llp",
+        "rules": ["30% flat + 12% surcharge above ₹1 crore + cess.", "Partner remuneration and up to 12% interest on capital deductible within limits.",
+                  "Partner's share of profit exempt in partner's hands; remuneration taxable.", "TDS 10% on partner remuneration/interest above ₹20,000."],
+        "verified": True, "src": ["aaptax_firm", "taxguru_tds_2025act"],
+    },
+    "llp": {
+        "label": "Limited Liability Partnership (LLP)", "group": "Firms & LLPs", "engine": "firm_llp",
+        "rules": ["Taxed like a partnership firm: 30% flat.", "No dividend distribution layer — profits reach partners tax-free (share of profit exempt).",
+                  "Often preferred over a company for holding investments when profits are to be distributed."],
+        "verified": True, "src": ["aaptax_firm"],
+    },
+    "company_private": {
+        "label": "Private limited company", "group": "Companies", "engine": "company",
+        "rules": ["Choose 115BAA (22% + 10% SC ≈ 25.17%) or normal (25%/30% + SC, MAT 14% final).",
+                  "Closely-held: loans/advances to shareholders with ≥10% voting power can be deemed dividend.",
+                  "Profits reach shareholders as dividends taxed again at slab — double taxation vs LLP.",
+                  "Shares issued above fair value: angel tax provision abolished from FY 2024-25 onward."],
+        "verified": False, "src": ["itd_rates_domestic", "bs_mat"],
+    },
+    "company_public_unlisted": {
+        "label": "Public limited company — unlisted", "group": "Companies", "engine": "company",
+        "rules": ["Same rate options as private companies.", "Deemed-dividend rule applies if not one in which the public is substantially interested."],
+        "verified": False, "src": [],
+    },
+    "company_public_listed": {
+        "label": "Public limited company — listed", "group": "Companies", "engine": "company",
+        "rules": ["Same rate options.", "Buybacks: shareholders taxed as capital gains from 1 Apr 2026; promoters effective 22% / 30%."],
+        "verified": True, "src": ["bs_buyback", "dh_buyback"],
+    },
+    "opc": {
+        "label": "One Person Company (OPC)", "group": "Companies", "engine": "company",
+        "rules": ["Taxed as a domestic company (115BAA / normal)."], "verified": False, "src": [],
+    },
+    "section8_company": {
+        "label": "Section 8 company (not-for-profit)", "group": "Charitable", "engine": "charitable",
+        "rules": ["If registered under the charitable regime: income exempt when applied to objects; otherwise taxed as a company."],
+        "verified": False, "src": [],
+    },
+    "producer_company": {
+        "label": "Producer company", "group": "Companies", "engine": "company",
+        "rules": ["Taxed as a domestic company; certain deductions for farmer producer companies existed under old regime."],
+        "verified": False, "src": [],
+    },
+    "foreign_company_branch": {
+        "label": "Foreign company / Indian branch", "group": "Companies", "engine": "company_foreign",
+        "rules": ["35% + surcharge 2% / 5% + cess on Indian income; DTAA may lower rates on dividends, interest, royalties.",
+                  "MAT 14% may apply; POEM in India makes it resident."],
+        "verified": False, "src": ["ey_mat"],
+    },
+    "fpi_corporate": {
+        "label": "FPI — corporate", "group": "Foreign investors", "engine": "fpi_corporate",
+        "rules": ["Equity STCG 20%, equity LTCG 12.5% above ₹1.25 lakh, other STCG 30%, other LTCG 12.5%, interest and dividends 20% (DTAA may lower).",
+                  "Surcharge at foreign-company rates.", "Gains on securities treated as capital gains, not business income."],
+        "ref": {"ita1961": "115AD"}, "verified": False, "src": [],
+    },
+    "fpi_non_corporate": {
+        "label": "FPI — non-corporate (fund trusts, individuals)", "group": "Foreign investors", "engine": "fpi_non_corporate",
+        "rules": ["Same rates as corporate FPIs; surcharge at individual-type rates with the 15% cap on capital gains."],
+        "ref": {"ita1961": "115AD"}, "verified": False, "src": [],
+    },
+    # ---------------- AOP / BOI / co-ops / others
+    "aop_determinate": {
+        "label": "AOP / BOI — shares determinate", "group": "AOP / BOI / others", "engine": "aop_boi",
+        "rules": ["Slab rates if no member's income exceeds the basic exemption; otherwise MMR on the share of the higher-taxed member."],
+        "verified": True, "src": ["itd_rates_huf", "inkl_mmr"],
+    },
+    "aop_indeterminate": {
+        "label": "AOP / BOI — shares indeterminate (incl. most JVs / consortiums / investment clubs)", "group": "AOP / BOI / others", "engine": "aop_mmr",
+        "rules": ["MMR on total income.", "Share of income in members' hands is exempt where the AOP has paid tax."],
+        "verified": True, "src": ["inkl_mmr"],
+    },
+    "cooperative": {
+        "label": "Co-operative society", "group": "AOP / BOI / others", "engine": "cooperative",
+        "rules": ["Normal: 10% / 20% / 30% slabs; or 115BAD 22%; new manufacturing co-ops 115BAE 15%.",
+                  "Surcharge 7% above ₹1 crore, 12% above ₹10 crore (normal); flat 10% under 115BAD/BAE."],
+        "verified": False, "src": [],
+    },
+    "local_authority": {
+        "label": "Local authority", "group": "AOP / BOI / others", "engine": "firm_llp",
+        "rules": ["30% flat; 12% surcharge above ₹1 crore."], "verified": True, "src": ["aaptax_firm"],
+    },
+    "ajp": {
+        "label": "Artificial juridical person (e.g. university, deity, statutory body)", "group": "AOP / BOI / others", "engine": "ajp",
+        "rules": ["Slab rates as for individuals; no 87A rebate; new regime default."], "verified": True, "src": ["itd_rates_huf"],
+    },
+    # ---------------- trusts (additional)
+    "trust_oral": {
+        "label": "Oral trust", "group": "Trusts", "engine": "trust_private_discretionary",
+        "rules": ["Always taxed at MMR."], "ref": {"ita1961": "164A", "ita2025": "308"}, "verified": True, "src": ["inkl_mmr"],
+    },
+    "trust_will_dependent": {
+        "label": "Will trust / trust for dependent relatives", "group": "Trusts", "engine": "aop_determinate_like",
+        "rules": ["Discretionary trusts created by will (only trust of the testator), or solely for dependent relatives, are taxed at normal slab rates instead of MMR."],
+        "verified": False, "src": [],
+    },
+    "trust_business": {
+        "label": "Private trust with business income", "group": "Trusts", "engine": "trust_private_discretionary",
+        "rules": ["MMR on whole income, except a will-trust solely for a dependent relative."], "ref": {"ita1961": "161"},
+        "verified": True, "src": ["inkl_mmr"],
+    },
+    "society_charitable": {
+        "label": "Registered society / charitable institution", "group": "Charitable", "engine": "charitable",
+        "rules": ["Same as charitable trust: exempt if registered and income applied (85%) to objects; investments in specified modes only."],
+        "verified": False, "src": [],
+    },
+    "provident_gratuity_trust": {
+        "label": "Approved provident / gratuity / superannuation fund trust", "group": "Trusts", "engine": "charitable",
+        "rules": ["Income of approved funds exempt; withdrawals taxed in employee's hands per scheme rules."], "verified": False, "src": [],
+    },
+    # ---------------- pooled vehicles (for reference)
+    "mutual_fund_entity": {
+        "label": "Mutual fund (SEBI-registered)", "group": "Pooled vehicles", "engine": "charitable",
+        "rules": ["Income of the fund exempt; investors taxed on IDCW and redemption gains."], "verified": True, "src": [],
+    },
+    "aif_entity": {
+        "label": "AIF (Cat I / II / III)", "group": "Pooled vehicles", "engine": None,
+        "rules": ["Cat I/II: pass-through except business income (taxed at fund level).", "Cat III: taxed at fund level, usually MMR on non-CG income."],
+        "verified": True, "src": ["itd_aif"],
+    },
+    "business_trust_entity": {
+        "label": "Business trust (REIT / InvIT)", "group": "Pooled vehicles", "engine": None,
+        "rules": ["Interest, dividend and rent passed through to unit holders; unit-holder treatment by component."],
+        "verified": True, "src": ["mondaq_reit"],
+    },
+    "family_office": {
+        "label": "Family office (any of the above)", "group": "Family structures", "engine": None,
+        "rules": ["Not a separate legal form — tax depends on the wrapper chosen: individual / HUF / private trust / LLP / company / GIFT City fund.",
+                  "Common Indian set-up: LLP or private company for operating wealth, private (specific) trust for succession, HUFs for income splitting."],
+        "verified": False, "src": [],
+    },
+}
+
+# --------------------------------------------------------------------------- extra capital assets
+EXTRA_ASSETS = [
+    {"id": "ipo_shares", "label": "Shares allotted in IPO / FPO (listed)", "follows": "listed_equity — holding counts from allotment date",
+     "lt_months": 12, "stcg": 20, "ltcg": 12.5, "exemption_112A": True, "cat": "Equity", "verified": True, "src": ["bs_ltcg_2026"]},
+    {"id": "sme_shares", "label": "SME-exchange listed shares", "lt_months": 12, "stcg": 20, "ltcg": 12.5, "exemption_112A": True,
+     "cat": "Equity", "notes": ["Listed on a recognised exchange and STT paid → same as main-board equity."], "verified": False, "src": []},
+    {"id": "bonus_rights", "label": "Bonus / rights shares, splits",
+     "follows": "Same asset rules; bonus cost = nil, holding from allotment; rights cost = amount paid; splits keep original date and pro-rata cost.",
+     "lt_months": 12, "stcg": 20, "ltcg": 12.5, "exemption_112A": True, "cat": "Equity", "verified": False, "src": []},
+    {"id": "esop_rsu_listed_india", "label": "ESOP / RSU shares — Indian listed employer",
+     "lt_months": 12, "stcg": 20, "ltcg": 12.5, "exemption_112A": True, "cat": "Equity",
+     "notes": ["Perquisite at exercise/vesting = FMV − price paid, taxed as salary.", "Cost for capital gains = FMV used for perquisite; holding from allotment.",
+               "Eligible-startup ESOPs: perquisite tax deferred."], "verified": False, "src": []},
+    {"id": "esop_rsu_foreign", "label": "ESOP / RSU shares — foreign / unlisted employer",
+     "lt_months": 24, "stcg": "slab", "ltcg": 12.5, "cat": "Foreign assets",
+     "notes": ["Perquisite at vesting/exercise taxed as salary.", "Report in Schedule FA when resident (ROR).", "Foreign tax credit via Form 67."], "verified": False, "src": []},
+    {"id": "preference_shares", "label": "Preference shares (listed)", "lt_months": 12, "stcg": "slab", "ltcg": 12.5, "cat": "Equity",
+     "notes": ["Not 'equity shares' — no 112A exemption, STCG at slab."], "verified": False, "src": []},
+    {"id": "warrants", "label": "Listed warrants", "lt_months": 12, "stcg": "slab", "ltcg": 12.5, "cat": "Equity", "verified": False, "src": []},
+    {"id": "foreign_equity", "label": "Foreign shares / ETFs / mutual funds bought via LRS (US stocks etc.)",
+     "lt_months": 24, "stcg": "slab", "ltcg": 12.5, "cat": "Foreign assets",
+     "notes": ["Not listed in India → 24 months; no 112A exemption.", "Dividends taxed at slab; US withholding 25% creditable via Form 67.",
+               "TCS on LRS remittances above the threshold (creditable).", "Schedule FA reporting mandatory for ROR; heavy penalties under the Black Money Act for non-disclosure."],
+     "verified": False, "src": []},
+    {"id": "adr_gdr", "label": "ADRs / GDRs", "lt_months": 24, "stcg": "slab", "ltcg": 12.5, "cat": "Foreign assets",
+     "notes": ["Transfers between non-residents outside India not taxable in India; conversion into underlying shares not a transfer."], "verified": False, "src": []},
+    {"id": "gift_city_fund", "label": "GIFT City (IFSC) fund units / IFSC-listed securities",
+     "lt_months": 24, "stcg": "slab", "ltcg": 12.5, "cat": "Foreign assets",
+     "notes": ["Treatment depends on the fund's structure and investor residency; several exemptions exist for non-residents and IFSC units. Verify case by case."],
+     "verified": False, "src": []},
+    {"id": "g_sec", "label": "Government securities / SDLs (RBI Retail Direct, exchange)",
+     "lt_months": 12, "stcg": "slab", "ltcg": 12.5, "cat": "Debt & fixed income",
+     "notes": ["Interest taxable at slab; no TDS on G-sec interest for residents.", "Treated as listed securities for holding period (verify)."],
+     "verified": False, "src": []},
+    {"id": "t_bill_cp_cd", "label": "T-bills, commercial paper, certificates of deposit",
+     "deemed_stcg": True, "stcg": "slab", "ltcg": None, "cat": "Debt & fixed income",
+     "notes": ["Discount earned is taxed at slab (as interest / short-term gain)."], "verified": False, "src": []},
+    {"id": "perpetual_bond", "label": "Perpetual / AT1 bonds (listed)", "lt_months": 12, "stcg": "slab", "ltcg": 12.5, "cat": "Debt & fixed income",
+     "notes": ["Coupon taxed at slab."], "verified": False, "src": []},
+    {"id": "deep_discount_bond", "label": "Deep discount bonds", "lt_months": 12, "stcg": "slab", "ltcg": 12.5, "cat": "Debt & fixed income",
+     "notes": ["Annual accretion may be taxable as interest depending on terms — verify."], "verified": False, "src": []},
+    {"id": "securitised_debt", "label": "Securitisation trust units / PTCs", "deemed_stcg": True, "stcg": "slab", "ltcg": None, "cat": "Debt & fixed income",
+     "notes": ["Income passed through and taxed in investor's hands; trust deducts TDS."], "verified": False, "src": ["itd_aif"]},
+    {"id": "egr", "label": "Electronic Gold Receipts (exchange-traded)", "lt_months": 12, "stcg": "slab", "ltcg": 12.5, "cat": "Gold & commodities",
+     "verified": False, "src": []},
+    {"id": "digital_gold", "label": "Digital gold (app-based)", "lt_months": 24, "stcg": "slab", "ltcg": 12.5, "cat": "Gold & commodities",
+     "notes": ["Not a SEBI/RBI-regulated security — taxed like physical gold."], "verified": False, "src": []},
+    {"id": "gold_monetisation", "label": "Gold Monetisation Scheme deposit certificates", "exempt_all": True, "cat": "Gold & commodities",
+     "notes": ["Interest and capital gains on deposit certificates exempt."], "verified": False, "src": []},
+    {"id": "art_collectibles", "label": "Art, paintings, sculptures, archaeological collections, drawings",
+     "lt_months": 24, "stcg": "slab", "ltcg": 12.5, "cat": "Alternatives",
+     "notes": ["Excluded from 'personal effects', so they are capital assets even if held personally."], "verified": False, "src": []},
+    {"id": "sm_reit", "label": "Small & Medium REIT units", "lt_months": 12, "stcg": 20, "ltcg": 12.5, "exemption_112A": True, "cat": "Real estate",
+     "notes": ["Same treatment as REIT units if listed and STT paid."], "verified": False, "src": []},
+    {"id": "fractional_realty", "label": "Fractional real-estate platforms (SPV shares / debentures)",
+     "follows": "Unlisted SPV shares → unlisted_equity; debentures → unlisted_bond (slab). SEBI-registered SM REIT → sm_reit.",
+     "lt_months": 24, "stcg": "slab", "ltcg": 12.5, "cat": "Real estate", "verified": False, "src": []},
+    {"id": "nft", "label": "NFTs and other VDAs", "flat": 30, "cat": "Digital assets",
+     "notes": ["Same as crypto: 30% flat, no loss set-off, 1% TDS."], "verified": False, "src": []},
+]
+
+# Categories for existing (base) assets
+ASSET_CATEGORY = {
+    "listed_equity": "Equity", "unlisted_equity": "Equity", "buyback": "Equity",
+    "equity_mf": "Mutual funds", "debt_mf_post_apr2023": "Mutual funds", "debt_mf_pre_apr2023": "Mutual funds",
+    "other_mf": "Mutual funds", "commodity_intl_etf": "Mutual funds", "sif": "Alternatives",
+    "listed_bond": "Debt & fixed income", "unlisted_bond": "Debt & fixed income", "mld": "Debt & fixed income",
+    "sgb": "Gold & commodities", "physical_gold": "Gold & commodities",
+    "real_estate": "Real estate", "reit_invit_units": "Real estate",
+    "ulip_high_premium": "Insurance & pension", "aif_units": "Alternatives", "pms": "Alternatives", "vda": "Digital assets",
+}
+
+# --------------------------------------------------------------------------- extra income items
+EXTRA_INCOME = [
+    {"id": "corporate_fd", "label": "Corporate / NBFC fixed deposits", "tax": "slab", "cat": "Deposits",
+     "notes": ["TDS 10% above ₹10,000 (other interest)."], "verified": True, "src": ["taxguru_tds_2025act"]},
+    {"id": "tax_saver_fd", "label": "5-year tax-saver bank FD", "tax": "slab", "cat": "Deposits",
+     "notes": ["Old regime: 80C up to ₹1.5 lakh; interest taxable."], "verified": False, "src": []},
+    {"id": "rd", "label": "Bank / post office recurring deposit", "tax": "slab", "cat": "Deposits", "verified": False, "src": []},
+    {"id": "nre_fcnr", "label": "NRE / FCNR(B) deposits", "tax": "exempt_conditional", "cat": "Deposits",
+     "notes": ["Interest exempt while the holder is non-resident (or RNOR for FCNR).", "Becomes taxable once resident (ROR); convert to resident / RFC accounts on return."],
+     "verified": False, "src": []},
+    {"id": "nro", "label": "NRO account / deposits", "tax": "slab", "cat": "Deposits",
+     "notes": ["Taxable; TDS 30% + surcharge + cess for NRIs, lower under DTAA."], "verified": False, "src": []},
+    {"id": "rfc", "label": "RFC (Resident Foreign Currency) account", "tax": "conditional", "cat": "Deposits",
+     "notes": ["Interest exempt while RNOR; taxable once ROR."], "verified": False, "src": []},
+    {"id": "foreign_deposit", "label": "Foreign bank deposits / foreign interest", "tax": "slab_if_ror", "cat": "Foreign assets",
+     "notes": ["Taxable for ROR; not taxable for RNOR/NR.", "Schedule FA reporting; foreign tax credit via Form 67."], "verified": False, "src": []},
+    {"id": "po_mis", "label": "Post Office Monthly Income Scheme", "tax": "slab", "cat": "Small savings", "verified": False, "src": []},
+    {"id": "po_td", "label": "Post Office Time Deposit (5-year qualifies 80C)", "tax": "slab", "cat": "Small savings", "verified": False, "src": []},
+    {"id": "kvp", "label": "Kisan Vikas Patra", "tax": "slab", "cat": "Small savings",
+     "notes": ["Interest taxable on accrual or at maturity (consistent method); no 80C."], "verified": False, "src": []},
+    {"id": "ssy", "label": "Sukanya Samriddhi Yojana", "tax": "exempt", "cat": "Small savings",
+     "notes": ["EEE; old regime 80C up to ₹1.5 lakh. Resident girl child only."], "verified": False, "src": []},
+    {"id": "nps_tier2", "label": "NPS Tier II", "tax": "unsettled", "cat": "Insurance & pension",
+     "notes": ["No deduction (except govt employees' Tier II under 80C with lock-in).", "Tax on withdrawal gains not expressly provided — commonly treated like debt/MF gains; verify."],
+     "verified": False, "src": []},
+    {"id": "nps_vatsalya", "label": "NPS Vatsalya (for minors)", "tax": "partly_exempt", "cat": "Insurance & pension",
+     "notes": ["Old regime: additional deduction for contributions (verify current limit).", "Converts to regular NPS at 18."], "verified": False, "src": []},
+    {"id": "apy", "label": "Atal Pension Yojana", "tax": "slab_on_pension", "cat": "Insurance & pension",
+     "notes": ["Contributions eligible under 80CCD(1) (old regime); pension taxable."], "verified": False, "src": []},
+    {"id": "annuity", "label": "Annuity / pension plan income", "tax": "slab", "cat": "Insurance & pension",
+     "notes": ["Commuted pension: fully exempt for govt employees; partly for others.", "Uncommuted pension taxable as salary."], "verified": False, "src": []},
+    {"id": "term_insurance", "label": "Term insurance / death benefit", "tax": "exempt", "cat": "Insurance & pension", "verified": True, "src": []},
+    {"id": "keyman_insurance", "label": "Keyman insurance proceeds", "tax": "taxable", "cat": "Insurance & pension",
+     "notes": ["Taxable in the recipient's hands (business income / salary / other sources)."], "verified": False, "src": []},
+    {"id": "gratuity", "label": "Gratuity", "tax": "exempt_with_limits", "cat": "Insurance & pension",
+     "notes": ["Exempt up to ₹25 lakh (non-govt) as per formula; govt employees fully exempt."], "verified": False, "src": []},
+    {"id": "rbi_frsb", "label": "RBI Floating Rate Savings Bonds", "tax": "slab", "cat": "Debt & fixed income",
+     "notes": ["Interest taxable; TDS applies."], "verified": False, "src": []},
+    {"id": "bond_54ec", "label": "54EC capital-gain bonds (NHAI / REC / PFC / IRFC)", "tax": "slab", "cat": "Debt & fixed income",
+     "notes": ["Interest taxable; principal locked 5 years; investing LTCG from land/building within 6 months saves up to ₹50 lakh of gains."], "verified": False, "src": []},
+    {"id": "p2p", "label": "P2P lending interest", "tax": "slab", "cat": "Alternatives",
+     "notes": ["Gross interest taxable; defaults / losses generally not deductible."], "verified": False, "src": []},
+    {"id": "rental_income", "label": "Rental income (house property)", "tax": "slab", "cat": "Real estate",
+     "notes": ["30% standard deduction on net annual value; home-loan interest deductible (let-out).", "TDS by tenant if rent > ₹50,000/month (individuals)."], "verified": False, "src": []},
+    {"id": "esop_perquisite", "label": "ESOP / RSU perquisite", "tax": "slab", "cat": "Equity",
+     "notes": ["Taxed as salary at exercise (FMV − price); employer deducts TDS."], "verified": False, "src": []},
+    {"id": "discount_income", "label": "Discount on T-bills / CP / CD / zero-coupon (held to maturity)", "tax": "slab", "cat": "Debt & fixed income",
+     "verified": False, "src": []},
+    {"id": "commodity_fno", "label": "Commodity derivatives (MCX / NCDEX)", "tax": "business_income", "cat": "Derivatives",
+     "notes": ["Non-speculative business income when traded on a recognised exchange; CTT applies on non-agri commodity futures (rate change in Budget 2026 — verify)."],
+     "verified": False, "src": ["bs_ltcg_2026"]},
+    {"id": "currency_fno", "label": "Currency derivatives (exchange-traded)", "tax": "business_income", "cat": "Derivatives",
+     "notes": ["Non-speculative business income; no STT/CTT."], "verified": False, "src": []},
+]
+
+INCOME_CATEGORY = {
+    "dividend": "Equity", "fd_interest": "Deposits", "savings_interest": "Deposits", "bond_interest": "Debt & fixed income",
+    "tax_free_bond_interest": "Debt & fixed income", "sgb_interest": "Gold & commodities", "ppf": "Small savings", "epf": "Insurance & pension",
+    "nps": "Insurance & pension", "scss": "Small savings", "nsc": "Small savings", "life_insurance": "Insurance & pension",
+    "reit_invit_distribution": "Real estate", "fno": "Derivatives", "intraday": "Derivatives", "gift": "Other",
+}
+
+# --------------------------------------------------------------------------- eligibility (FEMA / scheme rules)
+ELIGIBILITY = {
+    "note": "Who can invest — check before tax. Scheme rules and FEMA override tax planning.",
+    "rows": [
+        {"product": "Mutual funds", "resident": "Yes", "nri": "Yes (NRE/NRO; some AMCs restrict US/Canada residents)", "oci": "Yes (as NRI)", "foreign_national_nr": "Generally no (FPI route)", "huf": "Yes", "trust": "Yes (if trust deed permits)", "company": "Yes", "llp_firm": "Yes"},
+        {"product": "Listed shares (secondary)", "resident": "Yes", "nri": "Yes (PIS for repatriable)", "oci": "Yes", "foreign_national_nr": "FPI / FDI route", "huf": "Yes", "trust": "Yes", "company": "Yes", "llp_firm": "Yes"},
+        {"product": "PPF", "resident": "Yes", "nri": "No new account; existing continues to maturity", "oci": "No", "foreign_national_nr": "No", "huf": "No (since 2005)", "trust": "No", "company": "No", "llp_firm": "No"},
+        {"product": "SCSS", "resident": "60+ (55+ retirees)", "nri": "No", "oci": "No", "foreign_national_nr": "No", "huf": "No", "trust": "No", "company": "No", "llp_firm": "No"},
+        {"product": "Sukanya Samriddhi", "resident": "Resident girl child", "nri": "No new", "oci": "No", "foreign_national_nr": "No", "huf": "No", "trust": "No", "company": "No", "llp_firm": "No"},
+        {"product": "NSC / KVP / PO deposits", "resident": "Yes", "nri": "No new", "oci": "No", "foreign_national_nr": "No", "huf": "KVP: no; others vary", "trust": "Varies by scheme (verify)", "company": "No", "llp_firm": "No"},
+        {"product": "NPS", "resident": "Citizens 18–85", "nri": "Yes", "oci": "Yes", "foreign_national_nr": "No", "huf": "No", "trust": "No", "company": "Corporate model (employer)", "llp_firm": "No"},
+        {"product": "SGB", "resident": "No fresh RBI issues recently — secondary market only (verify)", "nri": "Can hold if bought as resident", "oci": "No", "foreign_national_nr": "No", "huf": "Yes", "trust": "Yes (charitable / trusts)", "company": "No", "llp_firm": "No"},
+        {"product": "PMS", "resident": "Yes (min ₹50 lakh)", "nri": "Yes", "oci": "Yes", "foreign_national_nr": "Limited", "huf": "Yes", "trust": "Yes", "company": "Yes", "llp_firm": "Yes"},
+        {"product": "AIF", "resident": "Yes (min ₹1 crore)", "nri": "Yes", "oci": "Yes", "foreign_national_nr": "Yes (foreign investor)", "huf": "Yes", "trust": "Yes", "company": "Yes", "llp_firm": "Yes"},
+        {"product": "SIF", "resident": "Yes (min ₹10 lakh)", "nri": "Yes", "oci": "Yes", "foreign_national_nr": "Generally no", "huf": "Yes", "trust": "Yes", "company": "Yes", "llp_firm": "Yes"},
+        {"product": "F&O", "resident": "Yes", "nri": "Yes (custodial / CP code)", "oci": "Yes", "foreign_national_nr": "FPI", "huf": "Yes", "trust": "Yes", "company": "Yes", "llp_firm": "Yes"},
+        {"product": "LRS foreign investing", "resident": "Individuals up to US$250,000/yr", "nri": "N/A", "oci": "N/A", "foreign_national_nr": "N/A", "huf": "No (LRS for individuals)", "trust": "No", "company": "ODI route", "llp_firm": "ODI route"},
+    ],
+    "verified": False, "src": [],
+}
+
+# --------------------------------------------------------------------------- structuring playbook
+STRUCTURING = [
+    {"id": "huf_split", "title": "HUF as a second taxpayer",
+     "points": ["Separate slabs and a separate ₹1.25 lakh equity LTCG exemption.",
+                "Fund it with ancestral property, gifts from relatives/non-members, or inheritance — a member's own money gifted in is clubbed back.",
+                "Partition is complex; plan exits before creating one."], "verified": False},
+    {"id": "gift_parents", "title": "Gifting to parents / adult children",
+     "points": ["No clubbing for gifts to parents, adult children or siblings — income on the gifted money is theirs.",
+                "Useful when they are in lower slabs or senior citizens (old-regime senior limits)."], "verified": False},
+    {"id": "clubbing_traps", "title": "Clubbing traps",
+     "points": ["Gifts to spouse or son's wife: income clubbed with the giver (gains on reinvestment too).",
+                "Minor's income clubbed with the higher-earning parent.",
+                "Clubbing doesn't apply to income on income (second-generation income) in most cases."], "verified": False},
+    {"id": "private_trust", "title": "Private trusts for succession",
+     "points": ["Specific (determinate) trust: taxed like beneficiaries — efficient.",
+                "Discretionary trust: MMR (~39%) — use only when control/succession benefits outweigh tax.",
+                "Transfer of assets into an irrevocable trust is generally not taxable for the settlor; revocable transfers keep income in settlor's hands."], "verified": False},
+    {"id": "llp_vs_company", "title": "LLP vs company for investments",
+     "points": ["LLP: 30% (≈34.9% with SC above ₹1 Cr), profits flow to partners tax-free.",
+                "Company 115BAA: ~25.17% but dividends taxed again in shareholders' hands — total can exceed LLP.",
+                "Company suits reinvestment / retained wealth; LLP suits distribution."], "verified": False},
+    {"id": "rnor_window", "title": "Returning NRIs — RNOR window",
+     "points": ["Foreign income and foreign capital gains stay outside Indian tax while RNOR (often 2–3 years).",
+                "Realise / restructure foreign holdings during RNOR; convert NRE/FCNR to resident/RFC accounts.",
+                "Schedule FA reporting begins once ROR."], "verified": False},
+    {"id": "nri_dtaa", "title": "NRIs — DTAA relief",
+     "points": ["Treaty rates can lower tax on dividends / interest (often 10–15%).",
+                "Some older treaties exempt certain capital gains in India — check the specific treaty and LOB clauses.",
+                "Need TRC + Form 10F; tax deducted at source can be claimed back by filing a return."], "verified": False},
+    {"id": "senior_parents", "title": "Senior parents — old regime and interest",
+     "points": ["Old regime: ₹3 lakh/₹5 lakh nil slab, 80TTB ₹50,000, 80C via SCSS — often lower tax than new regime for interest-heavy retirees.",
+                "Form 15H to avoid TDS where no tax is payable."], "verified": False},
+]
+
+CATEGORIES = ["Equity", "Mutual funds", "Debt & fixed income", "Deposits", "Small savings", "Gold & commodities",
+              "Real estate", "Alternatives", "Insurance & pension", "Derivatives", "Foreign assets", "Digital assets", "Other"]
