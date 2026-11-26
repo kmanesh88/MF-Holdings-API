@@ -1,0 +1,42 @@
+# Vantage · Alerts — daily price-move scans (advisor-facing only; nothing is sent to clients).
+# Wakes the Render service, then runs the scan; alerts land in the app's Alerts → Market Watch tab.
+# Uses repo secret TAX_AGENT_SECRET (already set for the tax agent; the API also accepts ALERTS_AGENT_SECRET).
+name: Alerts scan
+
+on:
+  schedule:
+    - cron: "0 2 * * 2-6"      # 07:30 IST Tue–Sat — after the US close
+    - cron: "30 10 * * 1-5"    # 16:00 IST Mon–Fri — after the Indian close (includes USD/INR)
+  workflow_dispatch:
+    inputs:
+      market:
+        description: "in | us"
+        default: "in"
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Pick market
+        id: m
+        run: |
+          if [ -n "${{ github.event.inputs.market }}" ]; then echo "market=${{ github.event.inputs.market }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event.schedule }}" = "0 2 * * 2-6" ]; then echo "market=us" >> $GITHUB_OUTPUT
+          else echo "market=in" >> $GITHUB_OUTPUT; fi
+      - name: Wake API (Render free plan sleeps)
+        run: |
+          for i in 1 2 3 4 5 6; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 60 "$API/alerts/config") && [ "$code" = "200" ] && exit 0
+            echo "attempt $i: $code"; sleep 20
+          done
+          exit 1
+        env:
+          API: https://mf-holdings-api.onrender.com
+      - name: Run scan
+        run: |
+          curl -sf --max-time 600 -X POST "$API/alerts/scan?market=$MARKET&wait=true" -H "X-Agent-Secret: $SECRET" | tee result.json
+          grep -q '"status":"ok"' result.json
+        env:
+          API: https://mf-holdings-api.onrender.com
+          SECRET: ${{ secrets.TAX_AGENT_SECRET }}
+          MARKET: ${{ steps.m.outputs.market }}
